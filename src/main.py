@@ -20,6 +20,8 @@ from src.ctrader_client import CTraderClient
 from src.deriv_client import DerivClient
 from src.mt5_client import MT5FileClient
 from src.mt5_direct_client import MT5DirectClient
+from src.mt5_bridge_file_client import MT5BridgeFileClient
+from src.alerting import alert_trade_opened, alert_trade_closed, alert_daily_summary, alert_error
 
 # Load environment variables
 load_dotenv('config/.env')
@@ -46,17 +48,25 @@ def _init_ctrader():
         return None
 
 def _init_mt5():
-    """Try MT5DirectClient (remote Windows) then MT5FileClient (local Wine)."""
-    # Remote Windows machine via mt5linux rpyc bridge
+    """Try MT5BridgeFileClient (ForexBotEA via rpyc) then local Wine fallback."""
     host = os.getenv('MT5_HOST', '')
     if host:
         port = int(os.getenv('MT5_PORT', '18812'))
+        # File bridge via rpyc — works regardless of MT5 Python package version
+        try:
+            client = MT5BridgeFileClient(host=host, port=port)
+            if client.ping(timeout=6.0):
+                logger.info(f"MT5 file bridge connected at {host}:{port}")
+                return client
+            logger.warning(f"MT5BridgeFileClient: EA not responding — is ForexBotEA running on a chart?")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"MT5BridgeFileClient init failed: {e}")
+        # Fallback: direct Python API (requires matching package/terminal versions)
         try:
             client = MT5DirectClient(host=host, port=port)
             if client.ping():
-                logger.info(f"MT5 connected to remote Windows machine at {host}:{port}")
+                logger.info(f"MT5 direct API connected at {host}:{port}")
                 return client
-            logger.warning(f"MT5DirectClient at {host}:{port} not responding")
         except Exception as e:
             logging.getLogger(__name__).warning(f"MT5DirectClient init failed: {e}")
 
@@ -216,6 +226,11 @@ class ForexTradingBot:
         
         if result['success']:
             logger.info(f"Order placed: {result['order_id']} | {pair} {signal['direction']} {lot_size} lots | ML conf: {ml_confidence:.2%}")
+            alert_trade_opened(
+                pair=pair, direction=signal['direction'], volume=lot_size,
+                entry=entry_price, sl=sl_price, tp=tp_price,
+                confidence=ml_confidence * 100, ticket=result.get('order_id', 0)
+            )
         else:
             logger.warning(f"Order rejected: {result['reason']}")
     
@@ -238,6 +253,12 @@ class ForexTradingBot:
                 if result['success']:
                     logger.info(f"Order closed: {order_id} | Reason: {exit_check['reason']} | P&L: ${result['pnl_usd']:.2f}")
                     self.daily_pnl += result['pnl_usd']
+                    alert_trade_closed(
+                        pair=order['pair'], direction=order['direction'],
+                        volume=order.get('lot_size', 0), entry=order.get('entry_price', 0),
+                        close_price=exit_check['close_price'], profit=result['pnl_usd'],
+                        ticket=order_id
+                    )
     
     def update_risk_state(self):
         """Check daily loss and update risk state"""

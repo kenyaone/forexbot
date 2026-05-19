@@ -9,10 +9,22 @@ Windows setup:
 Same interface as MT5FileClient.
 """
 
+import json
 import logging
+import os
+import time
 from datetime import datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+def _load_mt5_config():
+    """Load login credentials from config/mt5_config.json."""
+    cfg_path = Path(__file__).parent.parent / 'config' / 'mt5_config.json'
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            return json.load(f)
+    return {}
 
 _SYMBOL_MAP = {
     'EUR/USD': 'EURUSD',
@@ -35,18 +47,44 @@ class MT5DirectClient:
         self.host = host
         self.port = port
         self._mt5 = None
+        cfg = _load_mt5_config()
+        self._login    = int(cfg.get('login', 0)) or None
+        self._password = cfg.get('password', '') or None
+        self._server   = cfg.get('server', '') or None
 
     def _connect(self):
         from mt5linux import MetaTrader5
         self._mt5 = MetaTrader5(host=self.host, port=self.port)
+        kwargs = {}
+        if self._login:    kwargs['login']    = self._login
+        if self._password: kwargs['password'] = self._password
+        if self._server:   kwargs['server']   = self._server
+        ok = self._mt5.initialize(**kwargs)
+        if not ok:
+            raise ConnectionError(f"MT5 initialize failed: {self._mt5.last_error()}")
+
+    def _ensure_connected(self):
+        """Reconnect if the rpyc stream has dropped."""
+        try:
+            if self._mt5 is not None:
+                self._mt5.account_info()
+                return
+        except Exception:
+            pass
+        for attempt in range(3):
+            try:
+                self._connect()
+                if self._mt5.account_info() is not None:
+                    logger.info("MT5 reconnected")
+                    return
+            except Exception as e:
+                logger.warning(f"MT5 reconnect attempt {attempt+1} failed: {e}")
+                time.sleep(2)
+        raise ConnectionError("MT5 bridge unreachable after 3 attempts")
 
     def ping(self, timeout=5.0):
         try:
             self._connect()
-            ok = self._mt5.initialize()
-            if not ok:
-                logger.warning(f"MT5 initialize failed: {self._mt5.last_error()}")
-                return False
             info = self._mt5.account_info()
             return info is not None
         except Exception as e:
@@ -55,6 +93,7 @@ class MT5DirectClient:
 
     def get_account_info(self):
         try:
+            self._ensure_connected()
             info = self._mt5.account_info()
             if info is None:
                 return None
@@ -70,6 +109,7 @@ class MT5DirectClient:
 
     def get_tick(self, pair, timeout=5.0):
         try:
+            self._ensure_connected()
             sym = _sym(pair)
             tick = self._mt5.symbol_info_tick(sym)
             if tick is None:
@@ -86,6 +126,7 @@ class MT5DirectClient:
 
     def place_order(self, pair, direction, volume, sl_price, tp_price, timeout=10.0):
         try:
+            self._ensure_connected()
             sym = _sym(pair)
             tick = self._mt5.symbol_info_tick(sym)
             if tick is None:
@@ -128,6 +169,7 @@ class MT5DirectClient:
 
     def close_order(self, ticket, timeout=10.0):
         try:
+            self._ensure_connected()
             positions = self._mt5.positions_get(ticket=int(ticket))
             if not positions:
                 return {'success': False, 'reason': 'Position not found'}
@@ -169,6 +211,7 @@ class MT5DirectClient:
 
     def get_positions(self, timeout=5.0):
         try:
+            self._ensure_connected()
             positions = self._mt5.positions_get()
             if positions is None:
                 return []
