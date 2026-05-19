@@ -133,7 +133,7 @@ class ForexTradingBot:
 
         # Initialize modules
         self.data_pipeline = DataPipeline(ctrader_client=ct, deriv_client=deriv, mt5_client=mt5)
-        self.signal_engine = SignalEngine(ml_confidence_threshold=0.53)
+        self.signal_engine = SignalEngine(ml_confidence_threshold=0.55)
         self.risk_manager = RiskManager(
             account_equity=account_equity,
             risk_per_trade=risk_per_trade,
