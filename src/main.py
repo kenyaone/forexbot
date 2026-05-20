@@ -384,8 +384,17 @@ class ForexTradingBot:
         tick = self.data_pipeline.get_live_tick(pair)
         entry_price = tick['ask'] if signal['direction'] == 'BUY' else tick['bid']
 
-        # Pip size per pair (JPY pairs use 0.01, all others 0.0001)
+        # Spread filter: skip if broker spread is too wide (news spike / low liquidity)
         pip = 0.01 if 'JPY' in pair else 0.0001
+        max_spread_pips = {'EUR/USD': 2.0, 'GBP/USD': 3.0, 'USD/JPY': 2.5,
+                           'AUD/USD': 3.0, 'USD/CHF': 3.0}.get(pair, 3.0)
+        bid = tick.get('bid', 0)
+        ask = tick.get('ask', 0)
+        if bid > 0 and ask > 0:
+            current_spread = (ask - bid) / pip
+            if current_spread > max_spread_pips:
+                logger.info(f"{pair}: skip — spread {current_spread:.1f} pips > max {max_spread_pips} pips")
+                return
         sl_pips = self.sl_pips
         tp_pips = self.tp_pips
 
