@@ -83,12 +83,16 @@ string ProcessCommand(string cmd)
 //+------------------------------------------------------------------+
 string CmdInfo()
 {
-   long   login   = AccountInfoInteger(ACCOUNT_LOGIN);
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
-   string server  = AccountInfoString(ACCOUNT_SERVER);
-   return StringFormat("OK|LOGIN=%d|BALANCE=%.2f|EQUITY=%.2f|SERVER=%s",
-                       login, balance, equity, server);
+   long   login        = AccountInfoInteger(ACCOUNT_LOGIN);
+   double balance      = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity       = AccountInfoDouble(ACCOUNT_EQUITY);
+   string server       = AccountInfoString(ACCOUNT_SERVER);
+   int    term_trade   = (int)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED);
+   int    acct_expert  = (int)AccountInfoInteger(ACCOUNT_TRADE_EXPERT);
+   int    acct_trade   = (int)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED);
+   int    mql_trade    = (int)MQLInfoInteger(MQL_TRADE_ALLOWED);
+   return StringFormat("OK|LOGIN=%d|BALANCE=%.2f|EQUITY=%.2f|SERVER=%s|TERM_AT=%d|ACCT_EXPERT=%d|ACCT_TRADE=%d|MQL_AT=%d",
+                       login, balance, equity, server, term_trade, acct_expert, acct_trade, mql_trade);
 }
 
 //+------------------------------------------------------------------+
@@ -103,6 +107,11 @@ string CmdTick(string symbol)
 //+------------------------------------------------------------------+
 string CmdOrder(ENUM_ORDER_TYPE type, string &parts[])
 {
+   if (!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return "ERR|EA live trading not enabled — right-click EA on chart → Properties → Common → Allow live trading";
+   if (!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return "ERR|Terminal algo trading disabled — click Algo Trading button in toolbar";
+
    string symbol = parts[1];
    double volume = StringToDouble(parts[2]);
    double sl     = StringToDouble(parts[3]);
