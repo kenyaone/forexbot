@@ -149,7 +149,15 @@ string CmdOrder(ENUM_ORDER_TYPE type, string &parts[])
 //+------------------------------------------------------------------+
 string CmdClose(long ticket)
 {
-   if (!PositionSelectByTicket(ticket))
+   // PositionSelectByTicket() is unreliable in OnTimer context;
+   // iterate by index (same approach as CmdPositions) to select the position.
+   bool found = false;
+   int  total = PositionsTotal();
+   for (int i = 0; i < total; i++)
+   {
+      if ((long)PositionGetTicket(i) == ticket) { found = true; break; }
+   }
+   if (!found)
       return "ERR|position not found: " + IntegerToString(ticket);
 
    string symbol  = PositionGetString(POSITION_SYMBOL);
