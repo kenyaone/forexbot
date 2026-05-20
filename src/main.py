@@ -138,7 +138,7 @@ class ForexTradingBot:
 
         # Initialize modules
         self.data_pipeline = DataPipeline(ctrader_client=ct, deriv_client=deriv, mt5_client=mt5)
-        self.signal_engine = SignalEngine(ml_confidence_threshold=0.55)
+        self.signal_engine = SignalEngine(ml_confidence_threshold=0.52)
         self.risk_manager = RiskManager(
             account_equity=account_equity,
             risk_per_trade=risk_per_trade,
@@ -160,7 +160,9 @@ class ForexTradingBot:
         self.trading_pairs = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CHF']
         self.running = False
         self.daily_pnl = 0
-        self._cross_data = {}  # refreshed each cycle
+        self._cross_data = {}
+        self._cycle_count = 0
+        self._scan_results = {}  # pair → (direction, confidence)
     
     def is_trading_hours(self):
         """Check if we're in trading session (07:00-17:00 UTC)"""
@@ -196,24 +198,27 @@ class ForexTradingBot:
         signal = self.signal_engine.generate_signal(df, ml_confidence=ml_confidence)
         
         logger.info(f"{pair}: {signal['direction']} (ML conf: {ml_confidence:.2%}, regime: {signal.get('regime')})")
-        
+        self._scan_results[pair] = (signal['direction'], ml_confidence)
+
         if signal['direction'] == 'NONE':
             return
         
         # Get latest price
         tick = self.data_pipeline.get_live_tick(pair)
         entry_price = tick['ask'] if signal['direction'] == 'BUY' else tick['bid']
-        
-        # Calculate SL and TP based on ATR
-        atr = df['atr'].iloc[-1]
-        atr_pips = atr * 10000
-        
+
+        # Pip size per pair (JPY pairs use 0.01, all others 0.0001)
+        pip = 0.01 if 'JPY' in pair else 0.0001
+        sl_pips = 30   # fixed 30-pip stop
+        tp_pips = 60   # fixed 60-pip target (1:2 R:R)
+        atr_pips = sl_pips  # for position sizing
+
         if signal['direction'] == 'BUY':
-            sl_price = entry_price - (atr * 1.0)  # 1× ATR stop
-            tp_price = entry_price + (atr * 3.0)  # 3× ATR target
+            sl_price = round(entry_price - sl_pips * pip, 5)
+            tp_price = round(entry_price + tp_pips * pip, 5)
         else:
-            sl_price = entry_price + (atr * 1.0)
-            tp_price = entry_price - (atr * 3.0)
+            sl_price = round(entry_price + sl_pips * pip, 5)
+            tp_price = round(entry_price - tp_pips * pip, 5)
         
         # Calculate position size
         lot_size = self.risk_manager.calculate_position_size(entry_price, sl_price, atr_pips)
@@ -308,8 +313,21 @@ class ForexTradingBot:
             
             # Update risk state
             self.update_risk_state()
-            
+
+            self._cycle_count += 1
             logger.info(f"Cycle complete | Equity: ${self.current_equity:.2f} | Daily P&L: ${self.daily_pnl:.2f} | State: {self.risk_manager.state.value}")
+
+            # Send scan heartbeat every 4 cycles (4 hours)
+            if self._cycle_count % 4 == 0 and self._scan_results:
+                lines = []
+                for p, (direction, conf) in self._scan_results.items():
+                    bar = '🟢' if direction != 'NONE' else ('🟡' if conf >= 0.48 else '⚪')
+                    lines.append(f"{bar} {p}: {conf:.0%} {direction if direction != 'NONE' else ''}")
+                _send_telegram(
+                    f"<b>📊 ForexBot Scan — {datetime.utcnow().strftime('%H:%M UTC')}</b>\n"
+                    + "\n".join(lines)
+                    + f"\nEquity: ${self.current_equity:,.2f} | P&L: ${self.daily_pnl:+.2f}"
+                )
         
         except Exception as e:
             logger.error(f"Error in trading cycle: {str(e)}")
