@@ -6,7 +6,7 @@ Orchestrates data pipeline, signal generation, risk management, and execution
 
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import os
 
@@ -25,6 +25,9 @@ from src.alerting import alert_trade_opened, alert_trade_closed, alert_daily_sum
 
 # Load environment variables
 load_dotenv('config/.env')
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def _init_ctrader():
     """Build a CTraderClient from env vars. Returns client or None."""
@@ -166,7 +169,7 @@ class ForexTradingBot:
     
     def is_trading_hours(self):
         """Check if we're in trading session (07:00-17:00 UTC)"""
-        now = datetime.utcnow()
+        now = _utcnow()
         hour = now.hour
         return 7 <= hour < 17
     
@@ -246,7 +249,7 @@ class ForexTradingBot:
     
     def check_exits(self):
         """Monitor open trades and close if TP/SL/time exit"""
-        now = datetime.utcnow()
+        now = _utcnow()
         
         for order_id, order in list(self.order_executor.open_orders.items()):
             tick = self.data_pipeline.get_live_tick(order['pair'])
@@ -303,7 +306,7 @@ class ForexTradingBot:
             self.check_exits()
 
             # Refresh cross-asset data once per cycle (shared across all pairs)
-            end = datetime.utcnow()
+            end = _utcnow()
             start = end - timedelta(days=60)
             self._cross_data = ForexDataFetcher.fetch_cross_assets(start, end, interval='1d')
 
@@ -324,7 +327,7 @@ class ForexTradingBot:
                     bar = '🟢' if direction != 'NONE' else ('🟡' if conf >= 0.48 else '⚪')
                     lines.append(f"{bar} {p}: {conf:.0%} {direction if direction != 'NONE' else ''}")
                 _send_telegram(
-                    f"<b>📊 ForexBot Scan — {datetime.utcnow().strftime('%H:%M UTC')}</b>\n"
+                    f"<b>📊 ForexBot Scan — {_utcnow().strftime('%H:%M UTC')}</b>\n"
                     + "\n".join(lines)
                     + f"\nEquity: ${self.current_equity:,.2f} | P&L: ${self.daily_pnl:+.2f}"
                 )
@@ -343,7 +346,7 @@ class ForexTradingBot:
             f"Pairs: {', '.join(self.trading_pairs)}\n"
             f"Risk/trade: {int(self.risk_manager.risk_per_trade * 100)}% | "
             f"Threshold: 55% confidence\n"
-            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+            f"{_utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         )
 
         last_summary_day = None
@@ -353,7 +356,7 @@ class ForexTradingBot:
                 self.run_one_cycle()
 
                 # Send daily summary once per day at end of trading session
-                now = datetime.utcnow()
+                now = _utcnow()
                 if now.hour >= 17 and last_summary_day != now.date():
                     last_summary_day = now.date()
                     trades_today = len([o for o in self.order_executor.open_orders.values()])
