@@ -184,6 +184,7 @@ class ForexTradingBot:
         self.trading_pairs = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CHF']
         self.running = False
         self.daily_pnl = 0
+        self.weekly_pnl = 0
         self._cross_data = {}
         self._cycle_count = 0
         self._scan_results = {}  # pair → (direction, confidence)
@@ -192,6 +193,9 @@ class ForexTradingBot:
         self._d1_trends = {}   # pair → 'UP' | 'DOWN' | None
         self._paused = False
         self._tg_offset = 0
+        self._last_health_ping = None
+        self._week_start_equity = account_equity
+        self.max_weekly_loss = float(os.getenv('MAX_WEEKLY_LOSS', '0.10'))
     
     def _process_telegram_commands(self):
         """Poll Telegram for user commands and act on them."""
@@ -376,6 +380,15 @@ class ForexTradingBot:
             logger.info(f"{pair}: skip — {signal['direction']} position already open")
             return
 
+        # Correlation filter: block same-direction entry on highly correlated pairs
+        _CORRELATED = [{'EUR/USD', 'GBP/USD'}, {'AUD/USD', 'USD/CHF'}]
+        open_pairs = {o['pair'] for o in self.order_executor.open_orders.values()
+                      if o['direction'] == signal['direction']}
+        for group in _CORRELATED:
+            if pair in group and open_pairs & group:
+                logger.info(f"{pair}: skip — correlated position already open ({open_pairs & group})")
+                return
+
         # News blackout: skip 30 min around high-impact events
         if self._news_blackout(pair):
             return
@@ -488,6 +501,20 @@ class ForexTradingBot:
                     self.current_equity = float(info['EQUITY'])
                     self.risk_manager.account_equity = self.current_equity
 
+            # Weekly drawdown check — reset Monday, halt if loss > 10%
+            now = _utcnow()
+            if now.weekday() == 0 and now.hour < 2:
+                self._week_start_equity = self.current_equity
+                self.weekly_pnl = 0
+            self.weekly_pnl = self.current_equity - self._week_start_equity
+            weekly_loss_pct = -self.weekly_pnl / self._week_start_equity if self._week_start_equity else 0
+            if weekly_loss_pct >= self.max_weekly_loss and not self._paused:
+                self._paused = True
+                logger.warning(f"Weekly loss limit hit ({weekly_loss_pct:.1%}) — pausing")
+                _send_telegram(f"<b>⛔ WEEKLY LOSS LIMIT HIT</b>\n"
+                               f"Loss: <b>${self.weekly_pnl:+,.2f}</b> ({weekly_loss_pct:.1%})\n"
+                               f"Bot paused. Send /resume to restart.")
+
             # Refresh news events (cached 6 hours)
             self._refresh_news()
 
@@ -559,6 +586,21 @@ class ForexTradingBot:
                         balance=self.current_equity,
                         daily_pnl=self.daily_pnl,
                         trades=trades_today,
+                    )
+
+                # Daily health ping at 09:00 UTC — confirms bot is alive
+                now = _utcnow()
+                if (now.hour == 9 and
+                        (self._last_health_ping is None or
+                         self._last_health_ping.date() < now.date())):
+                    self._last_health_ping = now
+                    open_count = len(self.order_executor.open_orders)
+                    _send_telegram(
+                        f"<b>💚 ForexBot Alive</b> — {now.strftime('%a %d %b %H:%M UTC')}\n"
+                        f"Equity: ${self.current_equity:,.2f} | "
+                        f"Week P&L: ${self.weekly_pnl:+,.2f}\n"
+                        f"Open trades: {open_count} | "
+                        f"State: {'⏸ PAUSED' if self._paused else '▶ ACTIVE'}"
                     )
 
                 # Wait for next cycle; poll Telegram commands every 30 s
