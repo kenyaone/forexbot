@@ -181,7 +181,8 @@ class ForexTradingBot:
         if not self.ml_model.load():
             logger.warning("ML model not found — using fallback confidence=0.55")
         
-        self.trading_pairs = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'AUD/USD', 'USD/CHF']
+        pairs_env = os.getenv('TRADING_PAIRS', 'EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CHF,USD/CAD,EUR/GBP,NZD/USD')
+        self.trading_pairs = [p.strip() for p in pairs_env.split(',') if p.strip()]
         self.running = False
         self.daily_pnl = 0
         self.weekly_pnl = 0
@@ -381,7 +382,10 @@ class ForexTradingBot:
             return
 
         # Correlation filter: block same-direction entry on highly correlated pairs
-        _CORRELATED = [{'EUR/USD', 'GBP/USD'}, {'AUD/USD', 'USD/CHF'}]
+        _CORRELATED = [
+            {'EUR/USD', 'GBP/USD', 'EUR/GBP'},  # EUR/GBP triangle — all share EUR or GBP
+            {'AUD/USD', 'NZD/USD'},              # commodity currencies vs USD
+        ]
         open_pairs = {o['pair'] for o in self.order_executor.open_orders.values()
                       if o['direction'] == signal['direction']}
         for group in _CORRELATED:
@@ -400,7 +404,8 @@ class ForexTradingBot:
         # Spread filter: skip if broker spread is too wide (news spike / low liquidity)
         pip = 0.01 if 'JPY' in pair else 0.0001
         max_spread_pips = {'EUR/USD': 2.0, 'GBP/USD': 3.0, 'USD/JPY': 2.5,
-                           'AUD/USD': 3.0, 'USD/CHF': 3.0}.get(pair, 3.0)
+                           'AUD/USD': 3.0, 'USD/CHF': 3.0, 'USD/CAD': 3.0,
+                           'EUR/GBP': 2.0, 'NZD/USD': 3.0}.get(pair, 3.0)
         bid = tick.get('bid', 0)
         ask = tick.get('ask', 0)
         if bid > 0 and ask > 0:

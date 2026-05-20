@@ -11,6 +11,9 @@ _YFINANCE_TICKERS = {
     'USD/JPY': 'USDJPY=X',
     'AUD/USD': 'AUDUSD=X',
     'USD/CHF': 'USDCHF=X',
+    'USD/CAD': 'USDCAD=X',
+    'EUR/GBP': 'EURGBP=X',
+    'NZD/USD': 'NZDUSD=X',
 }
 
 _YFINANCE_INTERVALS = {
