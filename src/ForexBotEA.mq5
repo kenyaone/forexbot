@@ -141,7 +141,7 @@ string CmdOrder(ENUM_ORDER_TYPE type, string &parts[])
       return StringFormat("ERR|%d: %s", res.retcode, ResultRetcodeDescription(res.retcode));
 
    if (res.retcode == TRADE_RETCODE_DONE)
-      return StringFormat("OK|TICKET=%d|PRICE=%.5f", res.order, res.price);
+      return "OK|TICKET=" + (string)res.order + StringFormat("|PRICE=%.5f", res.price);
 
    return StringFormat("ERR|%d: %s", res.retcode, ResultRetcodeDescription(res.retcode));
 }
@@ -213,8 +213,8 @@ string CmdPositions()
       double profit = PositionGetDouble(POSITION_PROFIT);
       string dir    = (ptype == POSITION_TYPE_BUY) ? "BUY" : "SELL";
 
-      result += StringFormat("|%d,%s,%s,%.2f,%.5f,%.5f,%.5f,%.2f",
-                             ticket, sym, dir, vol, open, sl, tp, profit);
+      result += "|" + (string)ticket + StringFormat(",%s,%s,%.2f,%.5f,%.5f,%.5f,%.2f",
+                             sym, dir, vol, open, sl, tp, profit);
    }
    return result;
 }
