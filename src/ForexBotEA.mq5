@@ -70,11 +70,12 @@ string ProcessCommand(string cmd)
 
    string op = parts[0];
 
-   if (op == "INFO")   return CmdInfo();
-   if (op == "TICK")   return (n >= 2) ? CmdTick(parts[1])   : "ERR|missing symbol";
-   if (op == "BUY")    return (n >= 5) ? CmdOrder(ORDER_TYPE_BUY,  parts) : "ERR|bad BUY args";
-   if (op == "SELL")   return (n >= 5) ? CmdOrder(ORDER_TYPE_SELL, parts) : "ERR|bad SELL args";
-   if (op == "CLOSE")  return (n >= 2) ? CmdClose((long)StringToInteger(parts[1])) : "ERR|missing ticket";
+   if (op == "INFO")      return CmdInfo();
+   if (op == "TICK")      return (n >= 2) ? CmdTick(parts[1])   : "ERR|missing symbol";
+   if (op == "BUY")       return (n >= 5) ? CmdOrder(ORDER_TYPE_BUY,  parts) : "ERR|bad BUY args";
+   if (op == "SELL")      return (n >= 5) ? CmdOrder(ORDER_TYPE_SELL, parts) : "ERR|bad SELL args";
+   if (op == "CLOSE")     return (n >= 2) ? CmdClose((long)StringToInteger(parts[1])) : "ERR|missing ticket";
+   if (op == "MODIFY")    return (n >= 4) ? CmdModify((long)StringToInteger(parts[1]), StringToDouble(parts[2]), StringToDouble(parts[3])) : "ERR|bad MODIFY args";
    if (op == "POSITIONS") return CmdPositions();
 
    return "ERR|unknown command: " + op;
@@ -189,6 +190,35 @@ string CmdClose(long ticket)
    if (res.retcode == TRADE_RETCODE_DONE)
       return "OK|closed";
 
+   return StringFormat("ERR|%d: %s", res.retcode, ResultRetcodeDescription(res.retcode));
+}
+
+//+------------------------------------------------------------------+
+string CmdModify(long ticket, double sl, double tp)
+{
+   bool found = false;
+   int  total = PositionsTotal();
+   for (int i = 0; i < total; i++)
+   {
+      if ((long)PositionGetTicket(i) == ticket) { found = true; break; }
+   }
+   if (!found)
+      return "ERR|position not found: " + IntegerToString(ticket);
+
+   string symbol = PositionGetString(POSITION_SYMBOL);
+
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.symbol   = symbol;
+   req.sl       = sl;
+   req.tp       = tp;
+
+   if (!OrderSend(req, res))
+      return StringFormat("ERR|%d: %s", res.retcode, ResultRetcodeDescription(res.retcode));
+   if (res.retcode == TRADE_RETCODE_DONE)
+      return "OK|modified";
    return StringFormat("ERR|%d: %s", res.retcode, ResultRetcodeDescription(res.retcode));
 }
 

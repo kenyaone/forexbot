@@ -6,6 +6,9 @@ Orchestrates data pipeline, signal generation, risk management, and execution
 
 import time
 import logging
+import json
+import re
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import os
@@ -22,6 +25,14 @@ from src.mt5_client import MT5FileClient
 from src.mt5_direct_client import MT5DirectClient
 from src.mt5_bridge_file_client import MT5BridgeFileClient
 from src.alerting import alert_trade_opened, alert_trade_closed, alert_daily_summary, alert_error, _send_telegram
+
+_PAIR_CURRENCIES = {
+    'EUR/USD': ['EUR', 'USD'],
+    'GBP/USD': ['GBP', 'USD'],
+    'USD/JPY': ['USD', 'JPY'],
+    'AUD/USD': ['AUD', 'USD'],
+    'USD/CHF': ['USD', 'CHF'],
+}
 
 # Load environment variables
 load_dotenv('config/.env')
@@ -166,7 +177,55 @@ class ForexTradingBot:
         self._cross_data = {}
         self._cycle_count = 0
         self._scan_results = {}  # pair → (direction, confidence)
+        self._news_events = []
+        self._last_news_refresh = None
     
+    def _refresh_news(self):
+        """Fetch this week's high-impact events from ForexFactory. Cached for 6 hours."""
+        now = _utcnow()
+        if self._last_news_refresh and (now - self._last_news_refresh).total_seconds() < 21600:
+            return
+        try:
+            url = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+            resp = urllib.request.urlopen(url, timeout=6)
+            events = json.loads(resp.read())
+            self._news_events = [e for e in events if e.get('impact') == 'High']
+            self._last_news_refresh = now
+            logger.info(f"News: loaded {len(self._news_events)} high-impact events")
+        except Exception as e:
+            logger.warning(f"News feed fetch failed: {e}")
+
+    def _parse_ff_datetime(self, s):
+        """Parse ForexFactory datetime string (e.g. '2025-05-02T12:30:00-0400') to naive UTC."""
+        try:
+            m = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})([+-])(\d{2})(\d{2})', s)
+            if m:
+                base = datetime.strptime(m.group(1), '%Y-%m-%dT%H:%M:%S')
+                sign = 1 if m.group(2) == '+' else -1
+                offset = timedelta(hours=int(m.group(3)), minutes=int(m.group(4))) * sign
+                return base - offset
+        except Exception:
+            pass
+        return None
+
+    def _news_blackout(self, pair, window_minutes=30):
+        """Return True if within window_minutes of a high-impact event for this pair's currencies."""
+        currencies = _PAIR_CURRENCIES.get(pair, [])
+        if not currencies or not self._news_events:
+            return False
+        now = _utcnow()
+        for event in self._news_events:
+            if event.get('country', '').upper() not in currencies:
+                continue
+            event_time = self._parse_ff_datetime(event.get('date', ''))
+            if event_time is None:
+                continue
+            diff_min = abs((event_time - now).total_seconds()) / 60
+            if diff_min <= window_minutes:
+                logger.info(f"{pair}: news blackout — {event.get('title')} in {diff_min:.0f} min")
+                return True
+        return False
+
     def is_trading_hours(self):
         """Check if we're in trading session (07:00-17:00 UTC)"""
         now = _utcnow()
@@ -205,7 +264,17 @@ class ForexTradingBot:
 
         if signal['direction'] == 'NONE':
             return
-        
+
+        # Direction filter: max 1 position per direction at a time
+        open_dirs = {o['direction'] for o in self.order_executor.open_orders.values()}
+        if signal['direction'] in open_dirs:
+            logger.info(f"{pair}: skip — {signal['direction']} position already open")
+            return
+
+        # News blackout: skip 30 min around high-impact events
+        if self._news_blackout(pair):
+            return
+
         # Get latest price
         tick = self.data_pipeline.get_live_tick(pair)
         entry_price = tick['ask'] if signal['direction'] == 'BUY' else tick['bid']
@@ -214,7 +283,6 @@ class ForexTradingBot:
         pip = 0.01 if 'JPY' in pair else 0.0001
         sl_pips = 30   # fixed 30-pip stop
         tp_pips = 60   # fixed 60-pip target (1:2 R:R)
-        atr_pips = sl_pips  # for position sizing
 
         if signal['direction'] == 'BUY':
             sl_price = round(entry_price - sl_pips * pip, 5)
@@ -222,9 +290,9 @@ class ForexTradingBot:
         else:
             sl_price = round(entry_price + sl_pips * pip, 5)
             tp_price = round(entry_price - tp_pips * pip, 5)
-        
+
         # Calculate position size
-        lot_size = self.risk_manager.calculate_position_size(entry_price, sl_price, atr_pips)
+        lot_size = self.risk_manager.calculate_position_size(pair, entry_price, sl_price)
         
         # Place order
         result = self.order_executor.place_order(
@@ -254,7 +322,10 @@ class ForexTradingBot:
         for order_id, order in list(self.order_executor.open_orders.items()):
             tick = self.data_pipeline.get_live_tick(order['pair'])
             current_price = (tick['bid'] + tick['ask']) / 2
-            
+
+            # Apply trailing stop (moves SL when 20+ pips in profit)
+            self.order_executor.apply_trailing_stop(order_id, current_price)
+
             exit_check = self.order_executor.check_exit_conditions(order_id, current_price, now)
             
             if exit_check['should_close']:
@@ -299,7 +370,10 @@ class ForexTradingBot:
                     self.current_equity = float(info['EQUITY'])
                     self.risk_manager.account_equity = self.current_equity
 
-            # Sync OANDA open trades (removes stale local orders)
+            # Refresh news events (cached 6 hours)
+            self._refresh_news()
+
+            # Sync MT5 open trades (removes stale / loads untracked positions)
             self.order_executor.sync_open_trades()
 
             # Check exits first
@@ -339,6 +413,7 @@ class ForexTradingBot:
         """Main bot loop"""
         self.running = True
         logger.info("Bot started with ML model")
+        self._refresh_news()
 
         _send_telegram(
             f"<b>🤖 ForexBot Started</b>\n"

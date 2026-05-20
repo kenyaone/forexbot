@@ -3,6 +3,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_MT5_SYM_TO_PAIR = {
+    'EURUSD': 'EUR/USD', 'GBPUSD': 'GBP/USD', 'USDJPY': 'USD/JPY',
+    'AUDUSD': 'AUD/USD', 'USDCHF': 'USD/CHF',
+}
+
 
 class OrderExecutor:
     """Place and manage orders via cTrader or Deriv API (mock fallback)."""
@@ -128,12 +133,14 @@ class OrderExecutor:
         return self._finalize_close(order_id, order, close_price, reason)
 
     def _finalize_close(self, order_id, order, close_price, reason):
+        pip = 0.01 if 'JPY' in order['pair'] else 0.0001
+        pip_val = (pip / close_price * 100000) if 'JPY' in order['pair'] and close_price > 0 else 10.0
         if order['direction'] == 'BUY':
-            pnl_pips = (close_price - order['entry_price']) * 10000
+            pnl_pips = (close_price - order['entry_price']) / pip
         else:
-            pnl_pips = (order['entry_price'] - close_price) * 10000
+            pnl_pips = (order['entry_price'] - close_price) / pip
 
-        pnl_usd = pnl_pips * order['lot_size'] * 10
+        pnl_usd = pnl_pips * order['lot_size'] * pip_val
         order.update({
             'close_price': close_price, 'close_time': datetime.utcnow(),
             'pnl_pips': pnl_pips, 'pnl_usd': pnl_usd,
@@ -156,11 +163,31 @@ class OrderExecutor:
 
     def _sync_mt5(self):
         try:
-            live = {str(p['ticket']) for p in self.mt5.get_positions()}
-            for oid in [o for o in list(self.open_orders) if not o.startswith('MOCK_') and o not in live]:
+            positions = self.mt5.get_positions()
+            live_tickets = {str(p['ticket']) for p in positions}
+
+            # Remove stale local orders
+            for oid in [o for o in list(self.open_orders) if not o.startswith('MOCK_') and o not in live_tickets]:
                 logger.info(f"Reconcile: removing stale MT5 order {oid}")
                 order = self.open_orders.pop(oid)
                 self.risk_manager.close_trade(order['pair'], order['entry_price'], 'SYNC')
+
+            # Add MT5 positions not yet tracked locally (e.g. after bot restart)
+            for pos in positions:
+                tid = str(pos['ticket'])
+                if tid not in self.open_orders:
+                    pair = _MT5_SYM_TO_PAIR.get(pos['symbol'], pos['symbol'])
+                    order = {
+                        'order_id': tid, 'pair': pair, 'direction': pos['direction'],
+                        'lot_size': pos['volume'], 'entry_price': pos['open_price'],
+                        'sl_price': pos['sl'], 'tp_price': pos['tp'],
+                        'open_time': datetime.utcnow(), 'signal_confidence': 0.0,
+                        'status': 'OPEN',
+                    }
+                    self.open_orders[tid] = order
+                    self.risk_manager.add_trade(pair, pos['direction'], pos['open_price'],
+                                                pos['sl'], pos['tp'], pos['volume'])
+                    logger.info(f"Reconcile: loaded MT5 position {tid} ({pair} {pos['direction']})")
         except Exception as e:
             logger.warning(f"MT5 sync failed: {e}")
 
@@ -207,7 +234,41 @@ class OrderExecutor:
 
         return {'should_close': False}
 
+    def apply_trailing_stop(self, order_id, current_price):
+        """Trail SL once 20+ pips in profit, keeping it 15 pips behind price."""
+        if order_id not in self.open_orders:
+            return False
+        order = self.open_orders[order_id]
+        pip = 0.01 if 'JPY' in order['pair'] else 0.0001
+        trail_trigger = 20 * pip
+        trail_dist    = 15 * pip
+
+        if order['direction'] == 'BUY':
+            profit = current_price - order['entry_price']
+            if profit >= trail_trigger:
+                new_sl = round(current_price - trail_dist, 5)
+                if new_sl > order['sl_price']:
+                    self._update_sl(order_id, order, new_sl, order['tp_price'])
+                    return True
+        else:
+            profit = order['entry_price'] - current_price
+            if profit >= trail_trigger:
+                new_sl = round(current_price + trail_dist, 5)
+                if new_sl < order['sl_price']:
+                    self._update_sl(order_id, order, new_sl, order['tp_price'])
+                    return True
+        return False
+
+    def _update_sl(self, order_id, order, new_sl, tp):
+        if self.mt5 is not None:
+            try:
+                result = self.mt5.modify_order(int(order_id), new_sl, tp)
+                if result.get('success'):
+                    old_sl = order['sl_price']
+                    order['sl_price'] = new_sl
+                    logger.info(f"Trail stop {order['pair']} SL {old_sl:.5f} → {new_sl:.5f}")
+            except Exception as e:
+                logger.warning(f"Trailing stop modify failed for {order_id}: {e}")
+
     def get_trade_log(self):
         return self.trade_log
-
-print("OrderExecutor (cTrader/Deriv) loaded")

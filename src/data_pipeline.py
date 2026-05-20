@@ -1,13 +1,25 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 
 logger = logging.getLogger(__name__)
 
+_YFINANCE_TICKERS = {
+    'EUR/USD': 'EURUSD=X',
+    'GBP/USD': 'GBPUSD=X',
+    'USD/JPY': 'USDJPY=X',
+    'AUD/USD': 'AUDUSD=X',
+    'USD/CHF': 'USDCHF=X',
+}
+
+_YFINANCE_INTERVALS = {
+    'H1': '1h', 'H4': '1h', 'H2': '1h', 'D1': '1d', '1h': '1h', '1d': '1d',
+}
+
 
 class DataPipeline:
-    """Fetch and normalize OHLCV data — cTrader or Deriv when connected, mock otherwise."""
+    """Fetch and normalize OHLCV data — cTrader, Deriv, yfinance, or mock fallback."""
 
     def __init__(self, ctrader_client=None, deriv_client=None, mt5_client=None, db_connection=None):
         self.ct = ctrader_client
@@ -23,7 +35,7 @@ class DataPipeline:
                 if not df.empty:
                     return df
             except Exception as e:
-                logger.warning(f"{pair}: cTrader candle fetch failed ({e}), trying Deriv")
+                logger.warning(f"{pair}: cTrader candle fetch failed ({e}), trying yfinance")
 
         if self.deriv is not None:
             try:
@@ -31,9 +43,49 @@ class DataPipeline:
                 if not df.empty:
                     return df
             except Exception as e:
-                logger.warning(f"{pair}: Deriv candle fetch failed ({e}), using mock")
+                logger.warning(f"{pair}: Deriv candle fetch failed ({e}), trying yfinance")
 
+        df = self._yfinance_candles(pair, timeframe, bars)
+        if df is not None and not df.empty:
+            return df
+
+        logger.warning(f"{pair}: all data sources failed, using mock candles")
         return self._mock_candles(bars)
+
+    def _yfinance_candles(self, pair, timeframe='H1', bars=100):
+        try:
+            import yfinance as yf
+            ticker = _YFINANCE_TICKERS.get(pair)
+            if not ticker:
+                return None
+            interval = _YFINANCE_INTERVALS.get(timeframe, '1h')
+            days = max(15, bars // 5 + 5) if interval == '1h' else (bars + 30)
+            end_dt = datetime.utcnow()
+            start_dt = end_dt - timedelta(days=days)
+            df = yf.download(ticker, start=start_dt, end=end_dt, interval=interval,
+                             progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.rename(columns={
+                'Open': 'open', 'High': 'high', 'Low': 'low',
+                'Close': 'close', 'Volume': 'volume',
+            })
+            df.reset_index(inplace=True)
+            for col in ('Datetime', 'Date', 'index'):
+                if col in df.columns:
+                    df.rename(columns={col: 'time'}, inplace=True)
+                    break
+            ts = pd.to_datetime(df['time'])
+            df['time'] = ts.dt.tz_convert(None) if ts.dt.tz is not None else ts
+            df = df[['time', 'open', 'high', 'low', 'close', 'volume']].dropna()
+            df = df.tail(bars).reset_index(drop=True)
+            logger.info(f"{pair}: yfinance fetched {len(df)} bars ({interval})")
+            return df
+        except Exception as e:
+            logger.warning(f"{pair}: yfinance fetch failed ({e})")
+            return None
 
     def normalise_data(self, df):
         df['time'] = pd.to_datetime(df['time'])

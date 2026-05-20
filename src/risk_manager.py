@@ -23,23 +23,20 @@ class RiskManager:
         self.daily_loss = 0
         self.open_trades = []
     
-    def calculate_position_size(self, entry_price, sl_price, atr_pips):
-        """
-        Half-Kelly position sizing
-        Returns lot size based on risk per trade
-        """
+    def calculate_position_size(self, pair, entry_price, sl_price):
+        """Position sizing: risk_per_trade % of equity over SL distance."""
         risk_amount = self.account_equity * self.risk_per_trade
-        sl_distance_pips = abs(entry_price - sl_price) * 10000  # Convert to pips
-        
+        pip = 0.01 if 'JPY' in str(pair) else 0.0001
+        sl_distance_pips = round(abs(entry_price - sl_price) / pip)
         if sl_distance_pips == 0:
-            return 0
-        
-        # Rough pip value for standard lot (varies by pair)
-        pip_value_per_lot = 10  # USD per pip per lot (approximate)
-        
+            return 0.01
+        # Pip value per standard lot in USD
+        if 'JPY' in str(pair) and entry_price > 0:
+            pip_value_per_lot = (pip / entry_price) * 100000
+        else:
+            pip_value_per_lot = 10.0
         lot_size = risk_amount / (sl_distance_pips * pip_value_per_lot)
-        lot_size = max(round(lot_size, 2), 0.01)  # Min 0.01 lots
-        
+        lot_size = max(round(lot_size, 2), 0.01)
         return lot_size
     
     def check_risk_state(self, current_equity, daily_pnl):
@@ -112,8 +109,13 @@ class RiskManager:
         """Close a trade and record P&L"""
         for trade in self.open_trades:
             if trade['pair'] == pair:
-                pnl_pips = (close_price - trade['entry_price']) * 10000
-                pnl_usd = pnl_pips * trade['lot_size'] * 10
+                pip = 0.01 if 'JPY' in pair else 0.0001
+                pip_val = (pip / close_price * 100000) if 'JPY' in pair and close_price > 0 else 10.0
+                if trade.get('direction') == 'BUY':
+                    pnl_pips = (close_price - trade['entry_price']) / pip
+                else:
+                    pnl_pips = (trade['entry_price'] - close_price) / pip
+                pnl_usd = pnl_pips * trade['lot_size'] * pip_val
                 trade['close_price'] = close_price
                 trade['pnl'] = pnl_usd
                 trade['close_reason'] = reason
@@ -121,5 +123,3 @@ class RiskManager:
                 self.daily_loss += pnl_usd
                 return trade
         return None
-
-print("RiskManager module loaded")

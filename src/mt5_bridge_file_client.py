@@ -82,6 +82,13 @@ class MT5BridgeFileClient:
             return {'success': True}
         return {'success': False, 'reason': resp or 'No response'}
 
+    def modify_order(self, ticket, sl_price, tp_price, timeout=10.0):
+        cmd = f'MODIFY|{ticket}|{sl_price:.5f}|{tp_price:.5f}'
+        resp = self._send(cmd, timeout=timeout)
+        if resp and resp.startswith('OK'):
+            return {'success': True}
+        return {'success': False, 'reason': resp or 'No response'}
+
     def get_positions(self, timeout=5.0):
         resp = self._send('POSITIONS', timeout=timeout)
         if not resp or not resp.startswith('OK'):
