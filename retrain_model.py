@@ -84,16 +84,18 @@ def walk_forward_score(X, y, n_splits=5):
     for fold, (train_idx, test_idx) in enumerate(tscv.split(X)):
         X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
         y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+        pos_weight = (1 - y_tr.mean()) / y_tr.mean() if y_tr.mean() > 0 else 1.0
         model = lgb.LGBMClassifier(
             n_estimators=500,
             learning_rate=0.02,
-            max_depth=6,
-            num_leaves=31,
+            max_depth=5,
+            num_leaves=25,
             subsample=0.8,
             colsample_bytree=0.7,
-            min_child_samples=50,
-            reg_alpha=0.1,
-            reg_lambda=0.1,
+            min_child_samples=80,
+            reg_alpha=0.2,
+            reg_lambda=0.2,
+            scale_pos_weight=pos_weight,
             random_state=42,
             verbose=-1,
         )
@@ -179,16 +181,19 @@ def main():
 
     # 4. Final model — train on all data
     logger.info("\n[4/4] Training final model on full dataset...")
+    pos_weight_final = (1 - y.mean()) / y.mean() if y.mean() > 0 else 1.0
+    logger.info(f"Class balance: {y.mean():.1%} wins → scale_pos_weight={pos_weight_final:.2f}")
     final_model = lgb.LGBMClassifier(
         n_estimators=1000,
         learning_rate=0.02,
-        max_depth=6,
-        num_leaves=31,
+        max_depth=5,
+        num_leaves=25,
         subsample=0.8,
         colsample_bytree=0.7,
-        min_child_samples=50,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
+        min_child_samples=80,
+        reg_alpha=0.2,
+        reg_lambda=0.2,
+        scale_pos_weight=pos_weight_final,
         random_state=42,
         verbose=-1,
     )

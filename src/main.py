@@ -179,6 +179,7 @@ class ForexTradingBot:
         self._scan_results = {}  # pair → (direction, confidence)
         self._news_events = []
         self._last_news_refresh = None
+        self._d1_trends = {}   # pair → 'UP' | 'DOWN' | None
     
     def _refresh_news(self):
         """Fetch this week's high-impact events from ForexFactory. Cached for 6 hours."""
@@ -228,10 +229,34 @@ class ForexTradingBot:
         return False
 
     def is_trading_hours(self):
-        """Check if we're in trading session (07:00-17:00 UTC)"""
+        """Check if we're in main trading session (07:00-17:00 UTC)"""
         now = _utcnow()
         hour = now.hour
         return 7 <= hour < 17
+
+    def is_entry_session(self):
+        """Only enter new trades during London open or NY open — highest momentum."""
+        hour = _utcnow().hour
+        return (7 <= hour < 10) or (13 <= hour < 16)
+
+    def _refresh_d1_trends(self):
+        """Fetch daily EMA(20) trend for each pair. UP if close > EMA20, else DOWN."""
+        from src.data_fetcher import ForexDataFetcher
+        trends = {}
+        for pair in self.trading_pairs:
+            try:
+                df = self.data_pipeline._yfinance_candles(pair, 'D1', bars=30)
+                if df is not None and len(df) >= 21:
+                    ema20 = df['close'].ewm(span=20).mean().iloc[-1]
+                    close = df['close'].iloc[-1]
+                    trends[pair] = 'UP' if close > ema20 else 'DOWN'
+                else:
+                    trends[pair] = None
+            except Exception as e:
+                logger.warning(f"{pair}: D1 trend fetch failed ({e})")
+                trends[pair] = None
+        self._d1_trends = trends
+        logger.info("D1 trends: " + " | ".join(f"{p}: {v}" for p, v in trends.items()))
     
     def process_pair(self, pair):
         """Generate signal and execute trade for a pair"""
@@ -257,13 +282,19 @@ class ForexTradingBot:
             logger.warning(f"{pair}: ML prediction failed, using fallback 0.55")
             ml_confidence = 0.55
         
-        # Generate signal with ML confidence
-        signal = self.signal_engine.generate_signal(df, ml_confidence=ml_confidence)
+        # Generate signal with ML confidence + daily trend filter
+        d1_trend = self._d1_trends.get(pair)
+        signal = self.signal_engine.generate_signal(df, ml_confidence=ml_confidence, d1_trend=d1_trend)
         
         logger.info(f"{pair}: {signal['direction']} (ML conf: {ml_confidence:.2%}, regime: {signal.get('regime')})")
         self._scan_results[pair] = (signal['direction'], ml_confidence)
 
         if signal['direction'] == 'NONE':
+            return
+
+        # Session filter: only enter during London open or NY open
+        if not self.is_entry_session():
+            logger.info(f"{pair}: skip — outside entry session (London/NY open only)")
             return
 
         # Direction filter: max 1 position per direction at a time
@@ -380,10 +411,11 @@ class ForexTradingBot:
             # Check exits first
             self.check_exits()
 
-            # Refresh cross-asset data once per cycle (shared across all pairs)
+            # Refresh cross-asset and D1 trend data once per cycle
             end = _utcnow()
             start = end - timedelta(days=60)
             self._cross_data = ForexDataFetcher.fetch_cross_assets(start, end, interval='1d')
+            self._refresh_d1_trends()
 
             # Generate signals for each pair
             for pair in self.trading_pairs:

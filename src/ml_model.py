@@ -105,11 +105,29 @@ def make_features(df, spread_pips=1.0):
             if name == 'vix':
                 f['vix_level'] = np.nan
 
-    # Target (only used during training, harmless during inference)
-    pip_size = 0.0001
-    spread   = spread_pips * pip_size
-    next_ret = df['close'].shift(-1) / df['close'] - 1
-    f['target'] = (next_ret > spread / df['close']).astype(int)
+    # Target: does this trade hit TP (+60 pips) before SL (-30 pips) within 48 bars?
+    # This directly predicts trade outcome — aligned with the actual 30/60 pip strategy.
+    n_forward = 48
+    tp_pips   = 60
+    sl_pips   = 30
+    close_arr = df['close'].values
+    high_arr  = df['high'].values
+    low_arr   = df['low'].values
+    n         = len(df)
+    targets   = np.zeros(n, dtype=float)
+    targets[n - n_forward:] = np.nan   # last 48 rows have no future data
+    for i in range(n - n_forward):
+        entry = close_arr[i]
+        pip   = 0.01 if entry > 50.0 else 0.0001
+        tp_lvl = entry + tp_pips * pip
+        sl_lvl = entry - sl_pips * pip
+        for j in range(i + 1, i + n_forward + 1):
+            if high_arr[j] >= tp_lvl:
+                targets[i] = 1.0
+                break
+            if low_arr[j] <= sl_lvl:
+                break   # SL hit first → stays 0
+    f['target'] = targets
 
     f = f.replace([np.inf, -np.inf], np.nan).dropna()
     return f
