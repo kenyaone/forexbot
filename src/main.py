@@ -187,7 +187,8 @@ class ForexTradingBot:
             return
         try:
             url = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
-            resp = urllib.request.urlopen(url, timeout=6)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            resp = urllib.request.urlopen(req, timeout=6)
             events = json.loads(resp.read())
             self._news_events = [e for e in events if e.get('impact') == 'High']
             self._last_news_refresh = now
