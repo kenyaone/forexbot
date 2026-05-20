@@ -21,7 +21,7 @@ from src.deriv_client import DerivClient
 from src.mt5_client import MT5FileClient
 from src.mt5_direct_client import MT5DirectClient
 from src.mt5_bridge_file_client import MT5BridgeFileClient
-from src.alerting import alert_trade_opened, alert_trade_closed, alert_daily_summary, alert_error
+from src.alerting import alert_trade_opened, alert_trade_closed, alert_daily_summary, alert_error, _send_telegram
 
 # Load environment variables
 load_dotenv('config/.env')
@@ -114,9 +114,6 @@ class ForexTradingBot:
     def __init__(self, account_equity=10000, risk_per_trade=0.02):
         logger.info(f"Initializing bot with equity: ${account_equity}")
 
-        self.account_equity = account_equity
-        self.current_equity = account_equity
-
         # Initialize broker — MT5 first, then cTrader, then Deriv, then mock
         mt5   = _init_mt5()
         ct    = _init_ctrader()  if mt5  is None else None
@@ -124,12 +121,20 @@ class ForexTradingBot:
 
         if mt5:
             logger.info("Broker: MT5 (IC Markets) connected via file bridge")
+            info = mt5.get_account_info()
+            if info and info.get('BALANCE'):
+                account_equity = float(info['BALANCE'])
+                logger.info(f"Real account equity from MT5: ${account_equity:.2f}")
         elif ct:
             logger.info("Broker: cTrader connected")
         elif deriv:
             logger.info("Broker: Deriv connected")
         else:
             logger.warning("No broker configured — running in mock mode")
+
+        self.mt5 = mt5
+        self.account_equity = account_equity
+        self.current_equity = account_equity
 
         # Initialize modules
         self.data_pipeline = DataPipeline(ctrader_client=ct, deriv_client=deriv, mt5_client=mt5)
@@ -279,6 +284,13 @@ class ForexTradingBot:
             return
         
         try:
+            # Refresh equity from MT5
+            if self.mt5:
+                info = self.mt5.get_account_info()
+                if info and info.get('EQUITY'):
+                    self.current_equity = float(info['EQUITY'])
+                    self.risk_manager.account_equity = self.current_equity
+
             # Sync OANDA open trades (removes stale local orders)
             self.order_executor.sync_open_trades()
 
@@ -306,16 +318,41 @@ class ForexTradingBot:
         """Main bot loop"""
         self.running = True
         logger.info("Bot started with ML model")
-        
+
+        _send_telegram(
+            f"<b>🤖 ForexBot Started</b>\n"
+            f"Balance: <b>${self.current_equity:,.2f}</b>\n"
+            f"Pairs: {', '.join(self.trading_pairs)}\n"
+            f"Risk/trade: {int(self.risk_manager.risk_per_trade * 100)}% | "
+            f"Threshold: 55% confidence\n"
+            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+        )
+
+        last_summary_day = None
+
         try:
             while self.running:
                 self.run_one_cycle()
-                time.sleep(cycle_interval)  # Wait 1 hour between cycles (H1 timeframe)
-        
+
+                # Send daily summary once per day at end of trading session
+                now = datetime.utcnow()
+                if now.hour >= 17 and last_summary_day != now.date():
+                    last_summary_day = now.date()
+                    trades_today = len([o for o in self.order_executor.open_orders.values()])
+                    alert_daily_summary(
+                        equity=self.current_equity,
+                        balance=self.current_equity,
+                        daily_pnl=self.daily_pnl,
+                        trades=trades_today,
+                    )
+
+                time.sleep(cycle_interval)
+
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
         except Exception as e:
             logger.error(f"Fatal error: {str(e)}")
+            alert_error(f"Fatal error — bot stopped: {str(e)}")
         finally:
             logger.info("Bot shutdown complete")
 

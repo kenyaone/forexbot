@@ -10,20 +10,15 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-_smtp_user    = os.getenv('ALERT_SMTP_USER', '')
-_smtp_pass    = os.getenv('ALERT_SMTP_PASS', '')
-_alert_email  = os.getenv('ALERT_EMAIL', '')
-_tg_token     = os.getenv('TELEGRAM_BOT_TOKEN', '')
-_tg_chat_id   = os.getenv('TELEGRAM_CHAT_ID', '')
-
-
 def _send_telegram(text: str):
-    if not all([_tg_token, _tg_chat_id]):
+    token   = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    chat_id = os.getenv('TELEGRAM_CHAT_ID', '')
+    if not all([token, chat_id]):
         return
     try:
-        url  = f"https://api.telegram.org/bot{_tg_token}/sendMessage"
+        url  = f"https://api.telegram.org/bot{token}/sendMessage"
         data = urllib.parse.urlencode({
-            'chat_id':    _tg_chat_id,
+            'chat_id':    chat_id,
             'text':       text,
             'parse_mode': 'HTML',
         }).encode()
@@ -34,17 +29,20 @@ def _send_telegram(text: str):
 
 
 def _send_email(subject: str, body: str):
-    if not all([_smtp_user, _smtp_pass, _alert_email]):
+    smtp_user   = os.getenv('ALERT_SMTP_USER', '')
+    smtp_pass   = os.getenv('ALERT_SMTP_PASS', '')
+    alert_email = os.getenv('ALERT_EMAIL', '')
+    if not all([smtp_user, smtp_pass, alert_email]):
         return
     try:
         msg = MIMEMultipart()
-        msg['From']    = _smtp_user
-        msg['To']      = _alert_email
+        msg['From']    = smtp_user
+        msg['To']      = alert_email
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
         with smtplib.SMTP('smtp.gmail.com', 587) as s:
             s.starttls()
-            s.login(_smtp_user, _smtp_pass)
+            s.login(smtp_user, smtp_pass)
             s.send_message(msg)
         logger.info(f"Email alert sent: {subject}")
     except Exception as e:
