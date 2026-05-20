@@ -125,8 +125,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ForexTradingBot:
-    def __init__(self, account_equity=10000, risk_per_trade=0.02):
-        logger.info(f"Initializing bot with equity: ${account_equity}")
+    def __init__(self):
+        # Read all parameters from .env
+        risk_per_trade      = float(os.getenv('RISK_PER_TRADE', '0.02'))
+        max_daily_loss      = float(os.getenv('MAX_DAILY_LOSS', '0.05'))
+        max_concurrent      = int(os.getenv('MAX_CONCURRENT_TRADES', '3'))
+        ml_threshold        = float(os.getenv('ML_THRESHOLD', '0.52'))
+        self.sl_pips        = int(os.getenv('SL_PIPS', '30'))
+        self.tp_pips        = int(os.getenv('TP_PIPS', '60'))
+        account_equity      = float(os.getenv('ACCOUNT_EQUITY', '10000'))
+
+        logger.info(f"Config: risk={risk_per_trade:.0%} SL={self.sl_pips}p TP={self.tp_pips}p "
+                    f"ML≥{ml_threshold} max_trades={max_concurrent}")
 
         # Initialize broker — MT5 first, then cTrader, then Deriv, then mock
         mt5   = _init_mt5()
@@ -152,12 +162,12 @@ class ForexTradingBot:
 
         # Initialize modules
         self.data_pipeline = DataPipeline(ctrader_client=ct, deriv_client=deriv, mt5_client=mt5)
-        self.signal_engine = SignalEngine(ml_confidence_threshold=0.52)
+        self.signal_engine = SignalEngine(ml_confidence_threshold=ml_threshold)
         self.risk_manager = RiskManager(
             account_equity=account_equity,
             risk_per_trade=risk_per_trade,
-            max_daily_loss=0.05,
-            max_concurrent_trades=3
+            max_daily_loss=max_daily_loss,
+            max_concurrent_trades=max_concurrent
         )
         self.order_executor = OrderExecutor(
             ctrader_client=ct,
@@ -180,7 +190,74 @@ class ForexTradingBot:
         self._news_events = []
         self._last_news_refresh = None
         self._d1_trends = {}   # pair → 'UP' | 'DOWN' | None
+        self._paused = False
+        self._tg_offset = 0
     
+    def _process_telegram_commands(self):
+        """Poll Telegram for user commands and act on them."""
+        token   = os.getenv('TELEGRAM_BOT_TOKEN', '')
+        chat_id = os.getenv('TELEGRAM_CHAT_ID', '')
+        if not token or not chat_id:
+            return
+        try:
+            url  = f"https://api.telegram.org/bot{token}/getUpdates?offset={self._tg_offset}&timeout=1"
+            resp = urllib.request.urlopen(url, timeout=6)
+            updates = json.loads(resp.read()).get('result', [])
+            for upd in updates:
+                self._tg_offset = upd['update_id'] + 1
+                msg = upd.get('message', {})
+                if str(msg.get('chat', {}).get('id', '')) != str(chat_id):
+                    continue
+                self._handle_command(msg.get('text', '').strip())
+        except Exception as e:
+            logger.debug(f"Telegram poll: {e}")
+
+    def _handle_command(self, cmd):
+        cmd = cmd.lower().split()[0] if cmd else ''
+        logger.info(f"Telegram command: {cmd}")
+
+        if cmd == '/status':
+            orders = list(self.order_executor.open_orders.values())
+            lines = [f"<b>📊 ForexBot Status</b>",
+                     f"Equity: <b>${self.current_equity:,.2f}</b>",
+                     f"Daily P&L: <b>${self.daily_pnl:+.2f}</b>",
+                     f"State: {self.risk_manager.state.value}",
+                     f"Mode: {'⏸ PAUSED' if self._paused else '▶️ ACTIVE'}",
+                     f"Open trades: {len(orders)}"]
+            for o in orders:
+                lines.append(f"  • {o['pair']} {o['direction']} {o['lot_size']}L")
+            _send_telegram('\n'.join(lines))
+
+        elif cmd == '/close_all':
+            _send_telegram("⚠️ Closing all positions...")
+            closed = 0
+            for order_id, order in list(self.order_executor.open_orders.items()):
+                tick = self.data_pipeline.get_live_tick(order['pair'])
+                price = (tick['bid'] + tick['ask']) / 2
+                result = self.order_executor.close_order(order_id, price, 'MANUAL')
+                if result['success']:
+                    closed += 1
+                    self.daily_pnl += result['pnl_usd']
+            _send_telegram(f"✅ Closed {closed} position(s) | P&L: ${self.daily_pnl:+.2f}")
+
+        elif cmd == '/pause':
+            self._paused = True
+            _send_telegram("⏸ Bot paused — no new trades until /resume")
+
+        elif cmd == '/resume':
+            self._paused = False
+            _send_telegram("▶️ Bot resumed")
+
+        elif cmd == '/help':
+            _send_telegram(
+                "<b>🤖 ForexBot Commands</b>\n"
+                "/status — equity, P&amp;L and open trades\n"
+                "/close_all — close every open position now\n"
+                "/pause — stop new entries (exits still run)\n"
+                "/resume — restart trading\n"
+                "/help — this message"
+            )
+
     def _refresh_news(self):
         """Fetch this week's high-impact events from ForexFactory. Cached for 6 hours."""
         now = _utcnow()
@@ -267,13 +344,9 @@ class ForexTradingBot:
         
         # Calculate indicators
         df = self.signal_engine.calculate_indicators(df)
-        
-        # Merge cross-asset columns so ML model can use them
-        for name, cdf in self._cross_data.items():
-            col = f'{name}_close'
-            if not cdf.empty:
-                recent_val = cdf['close'].iloc[-1]
-                df[col] = recent_val  # scalar broadcast — latest value on all rows
+
+        # Merge daily cross-asset data (DXY/Gold/TNX/VIX) into H1 df
+        df = self.data_pipeline.merge_cross_assets(df)
 
         # Get ML confidence from model
         try:
@@ -313,8 +386,8 @@ class ForexTradingBot:
 
         # Pip size per pair (JPY pairs use 0.01, all others 0.0001)
         pip = 0.01 if 'JPY' in pair else 0.0001
-        sl_pips = 30   # fixed 30-pip stop
-        tp_pips = 60   # fixed 60-pip target (1:2 R:R)
+        sl_pips = self.sl_pips
+        tp_pips = self.tp_pips
 
         if signal['direction'] == 'BUY':
             sl_price = round(entry_price - sl_pips * pip, 5)
@@ -389,7 +462,11 @@ class ForexTradingBot:
     
     def run_one_cycle(self):
         """Execute one trading cycle"""
-        
+
+        if self._paused:
+            logger.info("Bot paused — skipping cycle")
+            return
+
         if not self.is_trading_hours():
             logger.info("Outside trading hours — skipping cycle")
             return
@@ -475,7 +552,12 @@ class ForexTradingBot:
                         trades=trades_today,
                     )
 
-                time.sleep(cycle_interval)
+                # Wait for next cycle; poll Telegram commands every 30 s
+                elapsed = 0
+                while elapsed < cycle_interval and self.running:
+                    time.sleep(30)
+                    elapsed += 30
+                    self._process_telegram_commands()
 
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
@@ -486,5 +568,5 @@ class ForexTradingBot:
             logger.info("Bot shutdown complete")
 
 if __name__ == '__main__':
-    bot = ForexTradingBot(account_equity=10000, risk_per_trade=0.02)
+    bot = ForexTradingBot()
     bot.run(cycle_interval=3600)  # Run every hour for H1 bars

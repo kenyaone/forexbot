@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 CROSS_ASSET_NAMES = ('dxy', 'gold', 'tnx', 'vix')
 
 
-def make_features(df, spread_pips=1.0):
+def make_features(df, spread_pips=1.0, compute_target=True):
     """
     Build feature matrix from an OHLCV DataFrame (DatetimeIndex).
     Cross-asset columns expected as {name}_close (e.g. dxy_close).
@@ -83,6 +83,35 @@ def make_features(df, spread_pips=1.0):
     vol = df['volume'].replace(0, np.nan).ffill().fillna(1)
     f['vol_ratio'] = vol / vol.rolling(20).mean()
 
+    # Price position within recent range
+    hi20 = df['high'].rolling(20).max()
+    lo20 = df['low'].rolling(20).min()
+    f['range_pos20'] = (df['close'] - lo20) / (hi20 - lo20).replace(0, np.nan)
+    hi50 = df['high'].rolling(50).max()
+    lo50 = df['low'].rolling(50).min()
+    f['range_pos50'] = (df['close'] - lo50) / (hi50 - lo50).replace(0, np.nan)
+
+    # Momentum acceleration (2nd derivative)
+    ret1 = df['close'].pct_change(1)
+    f['mom_accel'] = ret1 - ret1.shift(3)
+
+    # Candle body and wick features
+    body = (df['close'] - df['open']).abs()
+    bar_range = (df['high'] - df['low']).replace(0, np.nan)
+    f['body_pct']    = body / bar_range           # body as fraction of bar
+    f['upper_wick']  = (df['high'] - df[['close','open']].max(axis=1)) / bar_range
+    f['lower_wick']  = (df[['close','open']].min(axis=1) - df['low']) / bar_range
+
+    # Consecutive directional bars (positive = up streak, negative = down streak)
+    direction = np.sign(df['close'] - df['open'])
+    consec = pd.Series(0.0, index=df.index)
+    for i in range(1, len(direction)):
+        if direction.iloc[i] == direction.iloc[i-1] and direction.iloc[i] != 0:
+            consec.iloc[i] = consec.iloc[i-1] + direction.iloc[i]
+        else:
+            consec.iloc[i] = direction.iloc[i]
+    f['consec_bars'] = consec / 5.0  # normalize
+
     # Time features
     idx = df.index if isinstance(df.index, pd.DatetimeIndex) else pd.DatetimeIndex(df.index)
     f['hour_sin']    = np.sin(2 * np.pi * idx.hour / 24)
@@ -100,36 +129,41 @@ def make_features(df, spread_pips=1.0):
             if name == 'vix':
                 f['vix_level'] = df[col] / 20.0
         else:
-            f[f'{name}_ret1d'] = np.nan
-            f[f'{name}_ret5d'] = np.nan
+            # Fill with 0 so missing cross-asset data doesn't drop all rows
+            f[f'{name}_ret1d'] = 0.0
+            f[f'{name}_ret5d'] = 0.0
             if name == 'vix':
-                f['vix_level'] = np.nan
+                f['vix_level'] = 0.0
 
     # Target: does this trade hit TP (+60 pips) before SL (-30 pips) within 48 bars?
-    # This directly predicts trade outcome — aligned with the actual 30/60 pip strategy.
-    n_forward = 48
-    tp_pips   = 60
-    sl_pips   = 30
-    close_arr = df['close'].values
-    high_arr  = df['high'].values
-    low_arr   = df['low'].values
-    n         = len(df)
-    targets   = np.zeros(n, dtype=float)
-    targets[n - n_forward:] = np.nan   # last 48 rows have no future data
-    for i in range(n - n_forward):
-        entry = close_arr[i]
-        pip   = 0.01 if entry > 50.0 else 0.0001
-        tp_lvl = entry + tp_pips * pip
-        sl_lvl = entry - sl_pips * pip
-        for j in range(i + 1, i + n_forward + 1):
-            if high_arr[j] >= tp_lvl:
-                targets[i] = 1.0
-                break
-            if low_arr[j] <= sl_lvl:
-                break   # SL hit first → stays 0
-    f['target'] = targets
+    if compute_target:
+        n_forward = 48
+        tp_pips   = 60
+        sl_pips   = 30
+        close_arr = df['close'].values
+        high_arr  = df['high'].values
+        low_arr   = df['low'].values
+        n         = len(df)
+        targets   = np.zeros(n, dtype=float)
+        targets[n - n_forward:] = np.nan
+        for i in range(n - n_forward):
+            entry = close_arr[i]
+            pip   = 0.01 if entry > 50.0 else 0.0001
+            tp_lvl = entry + tp_pips * pip
+            sl_lvl = entry - sl_pips * pip
+            for j in range(i + 1, i + n_forward + 1):
+                if high_arr[j] >= tp_lvl:
+                    targets[i] = 1.0
+                    break
+                if low_arr[j] <= sl_lvl:
+                    break
+        f['target'] = targets
+        f = f.replace([np.inf, -np.inf], np.nan).dropna()
+    else:
+        # Inference: drop NaN only on feature columns, not target
+        f = f.replace([np.inf, -np.inf], np.nan)
+        f = f.dropna()
 
-    f = f.replace([np.inf, -np.inf], np.nan).dropna()
     return f
 
 
@@ -146,7 +180,7 @@ class MLModel:
         if self.model is None:
             return 0.5
         try:
-            feat = make_features(df)
+            feat = make_features(df, compute_target=False)
             if feat.empty:
                 return 0.5
             X = feat[self.feature_names].iloc[-1:]

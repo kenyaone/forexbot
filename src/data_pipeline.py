@@ -17,6 +17,13 @@ _YFINANCE_INTERVALS = {
     'H1': '1h', 'H4': '1h', 'H2': '1h', 'D1': '1d', '1h': '1h', '1d': '1d',
 }
 
+_CROSS_ASSET_TICKERS = {
+    'dxy': 'DX-Y.NYB',
+    'gold': 'GC=F',
+    'tnx': '^TNX',
+    'vix': '^VIX',
+}
+
 
 class DataPipeline:
     """Fetch and normalize OHLCV data — cTrader, Deriv, yfinance, or mock fallback."""
@@ -27,6 +34,8 @@ class DataPipeline:
         self.mt5 = mt5_client
         self.db_connection = db_connection
         self.price_cache = {}
+        self._cross_asset_cache = None
+        self._cross_asset_fetched_at = None
 
     def fetch_historical_data(self, pair, timeframe='H1', bars=500):
         if self.ct is not None:
@@ -86,6 +95,58 @@ class DataPipeline:
         except Exception as e:
             logger.warning(f"{pair}: yfinance fetch failed ({e})")
             return None
+
+    def get_cross_assets(self, force_refresh=False):
+        """Fetch daily DXY, Gold, TNX, VIX data. Cached for 4 hours."""
+        now = datetime.utcnow()
+        if (not force_refresh and self._cross_asset_cache is not None
+                and self._cross_asset_fetched_at is not None
+                and (now - self._cross_asset_fetched_at).total_seconds() < 4 * 3600):
+            return self._cross_asset_cache
+
+        try:
+            import yfinance as yf
+            end_dt   = now
+            start_dt = end_dt - timedelta(days=15)
+            frames = {}
+            for name, ticker in _CROSS_ASSET_TICKERS.items():
+                try:
+                    df = yf.download(ticker, start=start_dt, end=end_dt, interval='1d',
+                                     progress=False, auto_adjust=True)
+                    if df is None or df.empty:
+                        continue
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    close_col = 'Close' if 'Close' in df.columns else df.columns[3]
+                    s = df[close_col].copy()
+                    s.index = pd.to_datetime(s.index).tz_localize(None)
+                    frames[f'{name}_close'] = s
+                except Exception:
+                    continue
+            result = pd.DataFrame(frames) if frames else pd.DataFrame()
+            self._cross_asset_cache = result
+            self._cross_asset_fetched_at = now
+            if not result.empty:
+                logger.info(f"Cross-assets fetched: {list(result.columns)}")
+            return result
+        except Exception as e:
+            logger.warning(f"Cross-asset fetch failed: {e}")
+            return pd.DataFrame()
+
+    def merge_cross_assets(self, df_h1):
+        """Forward-fill daily cross-asset data into an H1 DataFrame (DatetimeIndex required)."""
+        cross = self.get_cross_assets()
+        if cross.empty:
+            return df_h1
+        if 'time' in df_h1.columns:
+            # Reset-index based df — set time as index temporarily
+            df_h1 = df_h1.set_index('time')
+            aligned = cross.reindex(df_h1.index, method='ffill')
+            merged = df_h1.join(aligned, how='left')
+            return merged.reset_index().rename(columns={'index': 'time'})
+        else:
+            aligned = cross.reindex(df_h1.index, method='ffill')
+            return df_h1.join(aligned, how='left')
 
     def normalise_data(self, df):
         df['time'] = pd.to_datetime(df['time'])
