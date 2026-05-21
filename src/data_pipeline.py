@@ -92,6 +92,12 @@ class DataPipeline:
             ts = pd.to_datetime(df['time'])
             df['time'] = ts.dt.tz_convert(None) if ts.dt.tz is not None else ts
             df = df[['time', 'open', 'high', 'low', 'close', 'volume']].dropna()
+            # Drop the current incomplete bar — its OHLCV changes every minute
+            # and causes alternating ML confidence values across cycles
+            if interval == '1h' and len(df) > 1:
+                now_hour = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+                if pd.to_datetime(df['time'].iloc[-1]) >= pd.Timestamp(now_hour):
+                    df = df.iloc[:-1]
             df = df.tail(bars).reset_index(drop=True)
             logger.info(f"{pair}: yfinance fetched {len(df)} bars ({interval})")
             return df
