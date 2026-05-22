@@ -126,7 +126,7 @@ def precompute_signals(df, model, feature_names, threshold):
     atr_expanding = atr > atr_ma10 * 1.2
 
     # Mean reversion
-    mr_buy  = (~atr_expanding) & (close <= bb_lower * 1.02) & (rsi < 38)
+    mr_buy  = (~atr_expanding) & (close <= bb_lower * 1.02) & (rsi < 42)
     mr_sell = (~atr_expanding) & (close >= bb_upper * 0.98) & (rsi > 65)
 
     # Trend following
