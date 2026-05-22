@@ -19,6 +19,7 @@ class OrderExecutor:
         self.risk_manager = risk_manager
         self.open_orders = {}
         self.trade_log = []
+        self.stale_closes = []  # drained by main loop to send alerts + update daily_pnl
 
     # ------------------------------------------------------------------
     def place_order(self, pair, direction, lot_size, entry_price, sl_price, tp_price,
@@ -166,11 +167,24 @@ class OrderExecutor:
             positions = self.mt5.get_positions()
             live_tickets = {str(p['ticket']) for p in positions}
 
-            # Remove stale local orders
+            # Remove stale local orders (closed by MT5 via SL/TP)
             for oid in [o for o in list(self.open_orders) if not o.startswith('MOCK_') and o not in live_tickets]:
-                logger.info(f"Reconcile: removing stale MT5 order {oid}")
-                order = self.open_orders.pop(oid)
-                self.risk_manager.close_trade(order['pair'], order['entry_price'], 'SYNC')
+                order = self.open_orders[oid]
+                # Estimate close price: TP if price moved in profit direction, else SL
+                try:
+                    tick = self.mt5.get_tick(order['pair'])
+                    mid = (tick['bid'] + tick['ask']) / 2 if tick else order['entry_price']
+                except Exception:
+                    mid = order['entry_price']
+                pip = 0.01 if 'JPY' in order['pair'] else 0.0001
+                if order['direction'] == 'BUY':
+                    close_price = order['tp_price'] if mid >= order['tp_price'] else order['sl_price']
+                else:
+                    close_price = order['tp_price'] if mid <= order['tp_price'] else order['sl_price']
+                result = self._finalize_close(oid, order, close_price, 'MT5_CLOSED')
+                logger.info(f"Reconcile: MT5 closed {oid} ({order['pair']} {order['direction']}) | est. P&L: ${result['pnl_usd']:.2f}")
+                self.stale_closes.append({'order': order, 'pnl_usd': result['pnl_usd'],
+                                          'close_price': close_price, 'reason': 'MT5_CLOSED'})
 
             # Add MT5 positions not yet tracked locally (e.g. after bot restart)
             for pos in positions:

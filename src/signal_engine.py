@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 from src.indicators.indicators import Indicators
@@ -47,30 +48,44 @@ class SignalEngine:
         # ATR expanding >20% above 10-day avg → trending/volatile → skip mean-reversion
         atr_expanding = pd.notna(atr_ma10) and atr > atr_ma10 * 1.2
 
+        test_mode = os.getenv('SIGNAL_TEST_MODE', 'false').lower() == 'true'
         candidate = None
 
-        # --- PRIMARY: MEAN REVERSION ---
-        if not atr_expanding:
-            if close <= bb_lower * 1.02 and rsi < 42:
+        if test_mode:
+            # Loosened thresholds — fire on any BB touch or EMA crossover
+            if close <= bb_lower * 1.05 and rsi < 55:
                 candidate = 'BUY'
-            elif close >= bb_upper * 0.98 and rsi > 65:
+            elif close >= bb_upper * 0.95 and rsi > 45:
                 candidate = 'SELL'
+            if candidate is None and adx > 15:
+                if ema20 > ema50 and rsi < 65:
+                    candidate = 'BUY'
+                elif ema20 < ema50 and rsi > 35:
+                    candidate = 'SELL'
+        else:
+            # --- PRIMARY: MEAN REVERSION ---
+            if not atr_expanding:
+                if close <= bb_lower * 1.02 and rsi < 42:
+                    candidate = 'BUY'
+                elif close >= bb_upper * 0.98 and rsi > 65:
+                    candidate = 'SELL'
 
-        # --- SECONDARY: TREND FOLLOWING (strong trend + expanding ATR) ---
-        if candidate is None and adx > 30 and atr_expanding:
-            if ema20 > ema50 and 40 < rsi < 65:
-                candidate = 'BUY'
-            elif ema20 < ema50 and 35 < rsi < 60:
-                candidate = 'SELL'
+            # --- SECONDARY: TREND FOLLOWING (strong trend + expanding ATR) ---
+            if candidate is None and adx > 30 and atr_expanding:
+                if ema20 > ema50 and 40 < rsi < 65:
+                    candidate = 'BUY'
+                elif ema20 < ema50 and 35 < rsi < 60:
+                    candidate = 'SELL'
 
         if candidate is None:
             return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'No signal'}
 
-        # Multi-timeframe filter: align with daily trend
-        if d1_trend == 'UP' and candidate == 'SELL':
-            return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'Against D1 trend'}
-        if d1_trend == 'DOWN' and candidate == 'BUY':
-            return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'Against D1 trend'}
+        # Multi-timeframe filter: align with daily trend (skipped in test mode)
+        if not test_mode:
+            if d1_trend == 'UP' and candidate == 'SELL':
+                return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'Against D1 trend'}
+            if d1_trend == 'DOWN' and candidate == 'BUY':
+                return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'Against D1 trend'}
 
         if ml_confidence >= self.ml_threshold:
             return {

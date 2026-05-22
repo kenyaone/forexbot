@@ -196,6 +196,8 @@ class ForexTradingBot:
         self._tg_offset = 0
         self._last_health_ping = None
         self._week_start_equity = account_equity
+        self._day_start_equity = account_equity
+        self._last_pnl_reset_day = None
         self.max_weekly_loss = float(os.getenv('MAX_WEEKLY_LOSS', '0.10'))
     
     def _process_telegram_commands(self):
@@ -312,12 +314,16 @@ class ForexTradingBot:
 
     def is_trading_hours(self):
         """Check if we're in main trading session (07:00-17:00 UTC)"""
+        if os.getenv('TRADING_24H', 'false').lower() == 'true':
+            return True
         now = _utcnow()
         hour = now.hour
         return 7 <= hour < 17
 
     def is_entry_session(self):
         """Only enter new trades during London open or NY open — highest momentum."""
+        if os.getenv('TRADING_24H', 'false').lower() == 'true':
+            return True
         hour = _utcnow().hour
         return (7 <= hour < 10) or (13 <= hour < 16)
 
@@ -376,9 +382,9 @@ class ForexTradingBot:
             return
 
         # Direction filter: max 1 position per direction at a time
-        open_dirs = {o['direction'] for o in self.order_executor.open_orders.values()}
-        if signal['direction'] in open_dirs:
-            logger.info(f"{pair}: skip — {signal['direction']} position already open")
+        dir_holders = {o['direction']: o['pair'] for o in self.order_executor.open_orders.values()}
+        if signal['direction'] in dir_holders:
+            logger.info(f"{pair}: skip — {signal['direction']} already open on {dir_holders[signal['direction']]}")
             return
 
         # Correlation filter: block same-direction entry on highly correlated pairs
@@ -506,8 +512,17 @@ class ForexTradingBot:
                     self.current_equity = float(info['EQUITY'])
                     self.risk_manager.account_equity = self.current_equity
 
-            # Weekly drawdown check — reset Monday, halt if loss > 10%
+            # Daily P&L — reset at UTC midnight, derive from equity change
             now = _utcnow()
+            today = now.date()
+            if self._last_pnl_reset_day != today:
+                self._day_start_equity = self.current_equity
+                self._last_pnl_reset_day = today
+                self.daily_pnl = 0
+            else:
+                self.daily_pnl = self.current_equity - self._day_start_equity
+
+            # Weekly drawdown check — reset Monday, halt if loss > 10%
             if now.weekday() == 0 and now.hour < 2:
                 self._week_start_equity = self.current_equity
                 self.weekly_pnl = 0
@@ -525,6 +540,18 @@ class ForexTradingBot:
 
             # Sync MT5 open trades (removes stale / loads untracked positions)
             self.order_executor.sync_open_trades()
+
+            # Process trades closed by MT5 (SL/TP hit between cycles)
+            for sc in self.order_executor.stale_closes:
+                o = sc['order']
+                logger.info(f"Trade closed by MT5: {o['pair']} {o['direction']} | Reason: {sc['reason']} | Est. P&L: ${sc['pnl_usd']:.2f}")
+                alert_trade_closed(
+                    pair=o['pair'], direction=o['direction'],
+                    volume=o.get('lot_size', 0), entry=o.get('entry_price', 0),
+                    close_price=sc['close_price'], profit=sc['pnl_usd'],
+                    ticket=o['order_id']
+                )
+            self.order_executor.stale_closes.clear()
 
             # Check exits first
             self.check_exits()
