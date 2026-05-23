@@ -351,6 +351,9 @@ class ForexTradingBot:
         
         # Fetch latest data
         df = self.data_pipeline.fetch_historical_data(pair, timeframe='H1', bars=100)
+        if df is None or df.empty:
+            logger.warning(f"{pair}: no data available — skipping")
+            return
         df = self.data_pipeline.normalise_data(df)
         
         # Calculate indicators
@@ -502,6 +505,12 @@ class ForexTradingBot:
 
         if not self.is_trading_hours():
             logger.info("Outside trading hours — skipping cycle")
+            return
+
+        # Forex markets closed Saturday and most of Sunday
+        now_dow = _utcnow().weekday()  # 5=Saturday, 6=Sunday
+        if now_dow == 5 or (now_dow == 6 and _utcnow().hour < 21):
+            logger.info("Weekend — markets closed, skipping cycle")
             return
         
         try:

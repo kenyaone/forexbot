@@ -61,8 +61,8 @@ class DataPipeline:
         if df is not None and not df.empty:
             return df
 
-        logger.warning(f"{pair}: all data sources failed, using mock candles")
-        return self._mock_candles(bars)
+        logger.warning(f"{pair}: all data sources failed — skipping pair this cycle")
+        return None
 
     def _yfinance_candles(self, pair, timeframe='H1', bars=100):
         try:
