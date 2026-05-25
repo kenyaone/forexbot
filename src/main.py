@@ -198,6 +198,7 @@ class ForexTradingBot:
         self._week_start_equity = account_equity
         self._day_start_equity = account_equity
         self._last_pnl_reset_day = None
+        self._last_bar_time = {}  # pair → last seen bar timestamp
         self.max_weekly_loss = float(os.getenv('MAX_WEEKLY_LOSS', '0.10'))
     
     def _process_telegram_commands(self):
@@ -354,6 +355,11 @@ class ForexTradingBot:
         if df is None or df.empty:
             logger.warning(f"{pair}: no data available — skipping")
             return
+        latest_bar = df['time'].iloc[-1] if 'time' in df.columns else None
+        if latest_bar is not None and self._last_bar_time.get(pair) == latest_bar:
+            logger.info(f"{pair}: data unchanged since last cycle — skipping inference")
+            return
+        self._last_bar_time[pair] = latest_bar
         df = self.data_pipeline.normalise_data(df)
         
         # Calculate indicators

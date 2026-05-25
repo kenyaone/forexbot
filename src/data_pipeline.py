@@ -75,7 +75,7 @@ class DataPipeline:
             end_dt = datetime.utcnow()
             start_dt = end_dt - timedelta(days=days)
             df = yf.download(ticker, start=start_dt, end=end_dt, interval=interval,
-                             progress=False, auto_adjust=True)
+                             progress=False, auto_adjust=True, threads=False)
             if df is None or df.empty:
                 return None
             if isinstance(df.columns, pd.MultiIndex):
