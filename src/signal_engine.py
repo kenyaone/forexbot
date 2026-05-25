@@ -70,8 +70,8 @@ class SignalEngine:
                 elif close >= bb_upper * 0.98 and rsi > 65:
                     candidate = 'SELL'
 
-            # --- SECONDARY: TREND FOLLOWING (strong trend + expanding ATR) ---
-            if candidate is None and adx > 30 and atr_expanding:
+            # --- SECONDARY: TREND FOLLOWING (trend regime + expanding ATR) ---
+            if candidate is None and adx > 25 and atr_expanding:
                 if ema20 > ema50 and 40 < rsi < 65:
                     candidate = 'BUY'
                 elif ema20 < ema50 and 35 < rsi < 60:
