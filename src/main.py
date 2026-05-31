@@ -25,6 +25,7 @@ from src.mt5_client import MT5FileClient
 from src.mt5_direct_client import MT5DirectClient
 from src.mt5_bridge_file_client import MT5BridgeFileClient
 from src.alerting import alert_trade_opened, alert_trade_closed, alert_daily_summary, alert_error, _send_telegram
+from src.metrics_tracker import MetricsTracker
 
 _PAIR_CURRENCIES = {
     'EUR/USD': ['EUR', 'USD'],
@@ -62,20 +63,11 @@ def _init_ctrader():
         return None
 
 def _init_mt5():
-    """Try MT5BridgeFileClient (ForexBotEA via rpyc) then local Wine fallback."""
+    """Try MT5DirectClient (Python API) then MT5BridgeFileClient (ForexBotEA) then Wine fallback."""
     host = os.getenv('MT5_HOST', '')
     if host:
         port = int(os.getenv('MT5_PORT', '18812'))
-        # File bridge via rpyc — works regardless of MT5 Python package version
-        try:
-            client = MT5BridgeFileClient(host=host, port=port)
-            if client.ping(timeout=6.0):
-                logger.info(f"MT5 file bridge connected at {host}:{port}")
-                return client
-            logger.warning(f"MT5BridgeFileClient: EA not responding — is ForexBotEA running on a chart?")
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"MT5BridgeFileClient init failed: {e}")
-        # Fallback: direct Python API (requires matching package/terminal versions)
+        # Direct Python API — always recalculates SL/TP from fresh price, no MQL_AT dependency
         try:
             client = MT5DirectClient(host=host, port=port)
             if client.ping():
@@ -83,6 +75,19 @@ def _init_mt5():
                 return client
         except Exception as e:
             logging.getLogger(__name__).warning(f"MT5DirectClient init failed: {e}")
+        # Fallback: file bridge via ForexBotEA (requires EA running on chart with live trading enabled)
+        try:
+            client = MT5BridgeFileClient(host=host, port=port)
+            for attempt in range(3):
+                if client.ping(timeout=10.0):
+                    logger.info(f"MT5 file bridge connected at {host}:{port}")
+                    return client
+                if attempt < 2:
+                    logger.info(f"MT5 ping attempt {attempt+1} failed, retrying...")
+                    time.sleep(2)
+            logger.warning(f"MT5BridgeFileClient: EA not responding — is ForexBotEA running on a chart?")
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"MT5BridgeFileClient init failed: {e}")
 
     # Local Wine file bridge fallback
     files_path = os.getenv('MT5_FILES_PATH', '')
@@ -130,7 +135,8 @@ class ForexTradingBot:
         risk_per_trade      = float(os.getenv('RISK_PER_TRADE', '0.02'))
         max_daily_loss      = float(os.getenv('MAX_DAILY_LOSS', '0.05'))
         max_concurrent      = int(os.getenv('MAX_CONCURRENT_TRADES', '3'))
-        ml_threshold        = float(os.getenv('ML_THRESHOLD', '0.52'))
+        ml_threshold_floor  = float(os.getenv('ML_THRESHOLD_FLOOR', '0.50'))
+        ml_threshold        = max(float(os.getenv('ML_THRESHOLD', '0.52')), ml_threshold_floor)
         self.sl_pips        = int(os.getenv('SL_PIPS', '30'))
         self.tp_pips        = int(os.getenv('TP_PIPS', '60'))
         account_equity      = float(os.getenv('ACCOUNT_EQUITY', '10000'))
@@ -144,7 +150,8 @@ class ForexTradingBot:
         deriv = _init_deriv()    if ct   is None and mt5 is None else None
 
         if mt5:
-            logger.info("Broker: MT5 (IC Markets) connected via file bridge")
+            broker_type = 'direct Python API' if mt5.__class__.__name__ == 'MT5DirectClient' else 'file bridge EA'
+            logger.info(f"Broker: MT5 connected via {broker_type}")
             info = mt5.get_account_info()
             if info and info.get('BALANCE'):
                 account_equity = float(info['BALANCE'])
@@ -186,6 +193,7 @@ class ForexTradingBot:
         self.running = False
         self.daily_pnl = 0
         self.weekly_pnl = 0
+        self.total_trades = 8  # trades placed before this session (from MT5 history)
         self._cross_data = {}
         self._cycle_count = 0
         self._scan_results = {}  # pair → (direction, confidence)
@@ -199,7 +207,9 @@ class ForexTradingBot:
         self._day_start_equity = account_equity
         self._last_pnl_reset_day = None
         self._last_bar_time = {}  # pair → last seen bar timestamp
-        self.max_weekly_loss = float(os.getenv('MAX_WEEKLY_LOSS', '0.10'))
+        self.max_weekly_loss    = float(os.getenv('MAX_WEEKLY_LOSS', '0.10'))
+        self.ml_threshold_floor = ml_threshold_floor
+        self.metrics = MetricsTracker(persist_path='data/metrics.json')
     
     def _process_telegram_commands(self):
         """Poll Telegram for user commands and act on them."""
@@ -226,6 +236,7 @@ class ForexTradingBot:
 
         if cmd == '/status':
             orders = list(self.order_executor.open_orders.values())
+            m = self.metrics.compute(window=20)
             lines = [f"<b>📊 ForexBot Status</b>",
                      f"Equity: <b>${self.current_equity:,.2f}</b>",
                      f"Daily P&L: <b>${self.daily_pnl:+.2f}</b>",
@@ -234,7 +245,17 @@ class ForexTradingBot:
                      f"Open trades: {len(orders)}"]
             for o in orders:
                 lines.append(f"  • {o['pair']} {o['direction']} {o['lot_size']}L")
+            if m:
+                pf = m.get('profit_factor', 0)
+                pf_str = f"{pf:.2f}" if pf != float('inf') else "∞"
+                lines.append(
+                    f"WR: {m['win_rate']:.1%}  PF: {pf_str}  "
+                    f"Sharpe: {m['sharpe']:.2f}  ({m['total_trades']}t)"
+                )
             _send_telegram('\n'.join(lines))
+
+        elif cmd == '/metrics':
+            _send_telegram(self.metrics.format_telegram(window=20))
 
         elif cmd == '/close_all':
             _send_telegram("⚠️ Closing all positions...")
@@ -259,7 +280,8 @@ class ForexTradingBot:
         elif cmd == '/help':
             _send_telegram(
                 "<b>🤖 ForexBot Commands</b>\n"
-                "/status — equity, P&amp;L and open trades\n"
+                "/status — equity, P&amp;L, open trades and brief metrics\n"
+                "/metrics — full performance metrics (WR, PF, Sharpe, drawdown)\n"
                 "/close_all — close every open position now\n"
                 "/pause — stop new entries (exits still run)\n"
                 "/resume — restart trading\n"
@@ -453,14 +475,23 @@ class ForexTradingBot:
         )
         
         if result['success']:
-            logger.info(f"Order placed: {result['order_id']} | {pair} {signal['direction']} {lot_size} lots | ML conf: {ml_confidence:.2%}")
+            self.total_trades += 1
+            logger.info(f"Order placed: {result['order_id']} | {pair} {signal['direction']} {lot_size} lots | ML conf: {ml_confidence:.2%} | trade #{self.total_trades}")
             alert_trade_opened(
                 pair=pair, direction=signal['direction'], volume=lot_size,
                 entry=entry_price, sl=sl_price, tp=tp_price,
-                confidence=ml_confidence * 100, ticket=result.get('order_id', 0)
+                confidence=ml_confidence * 100, ticket=result.get('order_id', 0),
+                trade_num=self.total_trades
             )
+            if self.total_trades == 50:
+                _send_telegram(
+                    "<b>🎯 50 TRADES REACHED</b>\n"
+                    "Statistically significant sample — time to review performance.\n"
+                    f"Balance: ${self.current_equity:,.2f}"
+                )
         else:
             logger.warning(f"Order rejected: {result['reason']}")
+            _send_telegram(f"⚠️ <b>Order rejected</b>\n{pair} {signal['direction']} — <code>{result['reason']}</code>")
     
     def check_exits(self):
         """Monitor open trades and close if TP/SL/time exit"""
@@ -484,6 +515,15 @@ class ForexTradingBot:
                 if result['success']:
                     logger.info(f"Order closed: {order_id} | Reason: {exit_check['reason']} | P&L: ${result['pnl_usd']:.2f}")
                     self.daily_pnl += result['pnl_usd']
+                    self.metrics.record_trade(
+                        pair=order['pair'], direction=order['direction'],
+                        entry=order.get('entry_price', 0),
+                        close_price=exit_check['close_price'],
+                        pnl_usd=result['pnl_usd'], pnl_pips=result.get('pnl_pips', 0),
+                        outcome=exit_check['reason'], lot=order.get('lot_size', 0),
+                        slippage_pips=order.get('slippage_pips', 0.0),
+                        confidence=order.get('signal_confidence', 0.0),
+                    )
                     alert_trade_closed(
                         pair=order['pair'], direction=order['direction'],
                         volume=order.get('lot_size', 0), entry=order.get('entry_price', 0),
@@ -526,6 +566,7 @@ class ForexTradingBot:
                 if info and info.get('EQUITY'):
                     self.current_equity = float(info['EQUITY'])
                     self.risk_manager.account_equity = self.current_equity
+            self.metrics.update_equity(self.current_equity)
 
             # Daily P&L — reset at UTC midnight, derive from equity change
             now = _utcnow()
@@ -560,6 +601,18 @@ class ForexTradingBot:
             for sc in self.order_executor.stale_closes:
                 o = sc['order']
                 logger.info(f"Trade closed by MT5: {o['pair']} {o['direction']} | Reason: {sc['reason']} | Est. P&L: ${sc['pnl_usd']:.2f}")
+                pip = 0.01 if 'JPY' in o['pair'] else 0.0001
+                pnl_pips = ((sc['close_price'] - o.get('entry_price', 0)) / pip
+                            if o['direction'] == 'BUY'
+                            else (o.get('entry_price', 0) - sc['close_price']) / pip)
+                self.metrics.record_trade(
+                    pair=o['pair'], direction=o['direction'],
+                    entry=o.get('entry_price', 0), close_price=sc['close_price'],
+                    pnl_usd=sc['pnl_usd'], pnl_pips=pnl_pips,
+                    outcome=sc['reason'], lot=o.get('lot_size', 0),
+                    slippage_pips=o.get('slippage_pips', 0.0),
+                    confidence=o.get('signal_confidence', 0.0),
+                )
                 alert_trade_closed(
                     pair=o['pair'], direction=o['direction'],
                     volume=o.get('lot_size', 0), entry=o.get('entry_price', 0),
@@ -633,6 +686,7 @@ class ForexTradingBot:
                         balance=self.current_equity,
                         daily_pnl=self.daily_pnl,
                         trades=trades_today,
+                        metrics=self.metrics.compute(window=20),
                     )
 
                 # Daily health ping at 09:00 UTC — confirms bot is alive

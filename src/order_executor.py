@@ -55,9 +55,14 @@ class OrderExecutor:
         result = self.mt5.place_order(pair, direction, lot_size, sl_price, tp_price)
         if not result['success']:
             return {'success': False, 'reason': result['reason']}
-        ticket = result.get('ticket', 0)
+        ticket     = result.get('ticket', 0)
+        fill_price = result.get('fill_price') or result.get('price') or entry_price
+        pip        = 0.01 if 'JPY' in pair else 0.0001
+        slippage   = ((fill_price - entry_price) / pip if direction == 'BUY'
+                      else (entry_price - fill_price) / pip)
         return self._register_order(str(ticket), pair, direction, lot_size,
-                                    entry_price, sl_price, tp_price, signal_confidence)
+                                    fill_price, sl_price, tp_price, signal_confidence,
+                                    slippage_pips=slippage)
 
     def _ctrader_place(self, pair, direction, lot_size, entry_price,
                        sl_price, tp_price, signal_confidence):
@@ -90,15 +95,18 @@ class OrderExecutor:
                     sl_price, tp_price, signal_confidence):
         order_id = f"MOCK_{pair}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         return self._register_order(order_id, pair, direction, lot_size,
-                                    entry_price, sl_price, tp_price, signal_confidence)
+                                    entry_price, sl_price, tp_price, signal_confidence,
+                                    slippage_pips=0.0)
 
     def _register_order(self, order_id, pair, direction, lot_size,
-                        entry_price, sl_price, tp_price, signal_confidence):
+                        entry_price, sl_price, tp_price, signal_confidence,
+                        slippage_pips=0.0):
         order = {
             'order_id': order_id, 'pair': pair, 'direction': direction,
             'lot_size': lot_size, 'entry_price': entry_price,
             'sl_price': sl_price, 'tp_price': tp_price,
             'open_time': datetime.utcnow(), 'signal_confidence': signal_confidence,
+            'slippage_pips': slippage_pips,
             'status': 'OPEN',
         }
         self.open_orders[order_id] = order

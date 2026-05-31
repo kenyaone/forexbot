@@ -56,10 +56,11 @@ def _send(subject: str, body: str, tg_text: str = None):
 
 def alert_trade_opened(pair: str, direction: str, volume: float,
                        entry: float, sl: float, tp: float,
-                       confidence: float, ticket: int):
+                       confidence: float, ticket: int, trade_num: int = 0):
     pips_risk   = abs(entry - sl) * 10000
     pips_reward = abs(tp - entry) * 10000
     rr          = pips_reward / pips_risk if pips_risk else 0
+    progress    = f"Trade #{trade_num}/50" if trade_num else ""
 
     subject = f"ForexBot — {direction} {pair} opened"
     body = (
@@ -77,7 +78,7 @@ def alert_trade_opened(pair: str, direction: str, volume: float,
         f"Time:       {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
     )
     tg = (
-        f"<b>🟢 TRADE OPENED</b>\n"
+        f"<b>🟢 TRADE OPENED</b>  <i>{progress}</i>\n"
         f"<b>{direction} {pair}</b>\n"
         f"Entry: <code>{entry:.5f}</code>\n"
         f"SL: <code>{sl:.5f}</code> ({pips_risk:.1f} pips)\n"
@@ -119,7 +120,8 @@ def alert_trade_closed(pair: str, direction: str, volume: float,
     _send(subject, body, tg)
 
 
-def alert_daily_summary(equity: float, balance: float, daily_pnl: float, trades: int):
+def alert_daily_summary(equity: float, balance: float, daily_pnl: float, trades: int,
+                        metrics: dict = None):
     result = 'UP' if daily_pnl >= 0 else 'DOWN'
     emoji  = '📈' if daily_pnl >= 0 else '📉'
 
@@ -133,13 +135,20 @@ def alert_daily_summary(equity: float, balance: float, daily_pnl: float, trades:
         f"Trades:     {trades}\n"
         f"Date:       {datetime.utcnow().strftime('%Y-%m-%d UTC')}\n"
     )
-    tg = (
-        f"<b>{emoji} DAILY SUMMARY</b>\n"
-        f"Balance: ${balance:.2f} | Equity: ${equity:.2f}\n"
-        f"P&L: <b>${daily_pnl:+.2f}</b> | Trades: {trades}\n"
-        f"{datetime.utcnow().strftime('%Y-%m-%d UTC')}"
-    )
-    _send(subject, body, tg)
+    tg_lines = [
+        f"<b>{emoji} DAILY SUMMARY</b>",
+        f"Balance: ${balance:.2f} | Equity: ${equity:.2f}",
+        f"P&L: <b>${daily_pnl:+.2f}</b> | Trades today: {trades}",
+    ]
+    if metrics and metrics.get('total_trades', 0) >= 3:
+        pf = metrics.get('profit_factor', 0)
+        pf_str = f"{pf:.2f}" if pf != float('inf') else "∞"
+        tg_lines.append(
+            f"WR: {metrics['win_rate']:.1%}  PF: {pf_str}  "
+            f"Sharpe: {metrics['sharpe']:.2f}  MaxDD: {metrics['max_drawdown']:.1%}"
+        )
+    tg_lines.append(datetime.utcnow().strftime('%Y-%m-%d UTC'))
+    _send(subject, body, '\n'.join(tg_lines))
 
 
 def alert_error(message: str):
