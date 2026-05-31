@@ -65,9 +65,9 @@ class SignalEngine:
         else:
             # --- PRIMARY: MEAN REVERSION ---
             if not atr_expanding:
-                if close <= bb_lower * 1.02 and rsi < 42:
+                if close <= bb_lower * 1.03 and rsi < 42:
                     candidate = 'BUY'
-                elif close >= bb_upper * 0.98 and rsi > 65:
+                elif close >= bb_upper * 0.97 and rsi > 65:
                     candidate = 'SELL'
 
             # --- SECONDARY: TREND FOLLOWING (trend regime + expanding ATR) ---
@@ -80,12 +80,7 @@ class SignalEngine:
         if candidate is None:
             return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'No signal'}
 
-        # Multi-timeframe filter: align with daily trend (skipped in test mode)
-        if not test_mode:
-            if d1_trend == 'UP' and candidate == 'SELL':
-                return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'Against D1 trend'}
-            if d1_trend == 'DOWN' and candidate == 'BUY':
-                return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'Against D1 trend'}
+        # D1 trend filter disabled — mean-reversion entries fire in any direction
 
         if ml_confidence >= self.ml_threshold:
             return {

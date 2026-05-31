@@ -116,31 +116,34 @@ class MT5BridgeFileClient:
     def _send(self, command: str, timeout=5.0):
         cmd_file = FILES_DIR + r'\forexbot_cmd.txt'
         res_file = FILES_DIR + r'\forexbot_res.txt'
-        try:
-            conn = self._get_conn()
-            # MQL5 FILE_TXT reads/writes UTF-16 LE with BOM
-            conn.execute(f"""
+        for attempt in range(2):
+            try:
+                conn = self._get_conn()
+                # MQL5 FILE_TXT reads/writes UTF-16 LE with BOM
+                conn.execute(f"""
 import os
 if os.path.exists(r'{res_file}'):
     os.remove(r'{res_file}')
 with open(r'{cmd_file}', 'wb') as _f:
     _f.write({repr(command.encode('utf-16'))})
 """)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                exists = conn.eval(f"os.path.exists(r'{res_file}')")
-                if exists:
-                    raw = bytes(conn.eval(f"open(r'{res_file}','rb').read()"))
-                    result = raw.decode('utf-16', errors='replace').strip()
-                    conn.eval(f"os.remove(r'{res_file}')")
-                    return result
-                time.sleep(0.1)
-            logger.warning(f"MT5BridgeFileClient: timeout waiting for response to '{command}'")
-            return None
-        except Exception as e:
-            logger.error(f"MT5BridgeFileClient send error: {e}")
-            self._conn = None
-            return None
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    exists = conn.eval(f"os.path.exists(r'{res_file}')")
+                    if exists:
+                        raw = bytes(conn.eval(f"open(r'{res_file}','rb').read()"))
+                        result = raw.decode('utf-16', errors='replace').strip()
+                        conn.eval(f"os.remove(r'{res_file}')")
+                        return result
+                    time.sleep(0.1)
+                logger.warning(f"MT5BridgeFileClient: timeout waiting for response to '{command}'")
+                return None
+            except Exception as e:
+                logger.warning(f"MT5BridgeFileClient send error (attempt {attempt+1}): {e}")
+                self._conn = None
+                if attempt == 0:
+                    time.sleep(1)
+        return None
 
 
 def _sym(pair):

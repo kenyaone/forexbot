@@ -1,30 +1,19 @@
 """
-Remote MT5 client via mt5linux/rpyc bridge.
-Connects to the rpyc server running on a Windows machine that has MT5 open.
+Direct MT5 client via rpyc classic bridge.
+Uses rpyc.classic.connect() to call the MetaTrader5 Python API on the remote
+Windows machine. Results are serialised to plain dicts/primitives on the remote
+side before being returned, which avoids the rpyc netref expiry ("result expired")
+problem with NamedTuple objects.
 
-Windows setup:
-  pip install MetaTrader5 rpyc plumbum
-  python -m mt5linux --host 0.0.0.0 -p 18812
-
-Same interface as MT5FileClient.
+Windows bridge: python -m mt5linux --host 0.0.0.0 -p 18812
 """
 
-import json
 import logging
 import os
 import time
 from datetime import datetime
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-def _load_mt5_config():
-    """Load login credentials from config/mt5_config.json."""
-    cfg_path = Path(__file__).parent.parent / 'config' / 'mt5_config.json'
-    if cfg_path.exists():
-        with open(cfg_path) as f:
-            return json.load(f)
-    return {}
 
 _SYMBOL_MAP = {
     'EUR/USD': 'EURUSD',
@@ -34,200 +23,293 @@ _SYMBOL_MAP = {
     'USD/CHF': 'USDCHF',
 }
 
-# MT5 order type constants (same as MetaTrader5 package)
-ORDER_TYPE_BUY  = 0
-ORDER_TYPE_SELL = 1
-ORDER_FILLING_FOK = 0
-
 
 class MT5DirectClient:
-    """Connect to MT5 on a remote Windows machine via mt5linux rpyc bridge."""
+    """Connect to MT5 on a remote Windows machine via rpyc classic + MetaTrader5 API."""
 
     def __init__(self, host: str, port: int = 18812):
         self.host = host
         self.port = port
-        self._mt5 = None
-        cfg = _load_mt5_config()
-        self._login    = int(cfg.get('login', 0)) or None
-        self._password = cfg.get('password', '') or None
-        self._server   = cfg.get('server', '') or None
+        self._conn = None
 
-    def _connect(self):
-        from mt5linux import MetaTrader5
-        self._mt5 = MetaTrader5(host=self.host, port=self.port)
-        kwargs = {}
-        if self._login:    kwargs['login']    = self._login
-        if self._password: kwargs['password'] = self._password
-        if self._server:   kwargs['server']   = self._server
-        ok = self._mt5.initialize(**kwargs)
-        if not ok:
-            raise ConnectionError(f"MT5 initialize failed: {self._mt5.last_error()}")
-
-    def _ensure_connected(self):
-        """Reconnect if the rpyc stream has dropped."""
-        try:
-            if self._mt5 is not None:
-                self._mt5.account_info()
-                return
-        except Exception:
-            pass
-        for attempt in range(3):
+    def _get_conn(self):
+        if self._conn is not None:
             try:
-                self._connect()
-                if self._mt5.account_info() is not None:
-                    logger.info("MT5 reconnected")
-                    return
-            except Exception as e:
-                logger.warning(f"MT5 reconnect attempt {attempt+1} failed: {e}")
-                time.sleep(2)
-        raise ConnectionError("MT5 bridge unreachable after 3 attempts")
+                self._conn.ping()
+                return self._conn
+            except Exception:
+                self._conn = None
+        import rpyc
+        self._conn = rpyc.classic.connect(self.host, self.port)
+        self._conn.execute('import MetaTrader5 as mt5, subprocess, time')
+        ok = self._conn.eval('mt5.initialize(timeout=5000)')
+        if not ok:
+            # MT5 terminal may be gone — restart it and retry once
+            logger.warning('mt5.initialize failed, restarting terminal64.exe...')
+            self._conn.execute(
+                r"subprocess.Popen([r'C:\Program Files\MetaTrader 5\terminal64.exe'], "
+                r"creationflags=0x08000000)"
+            )
+            self._conn.eval('time.sleep(20)')
+            ok = self._conn.eval('mt5.initialize(timeout=10000)')
+            if not ok:
+                err = self._conn.eval('str(mt5.last_error())')
+                self._conn = None
+                raise RuntimeError(f'mt5.initialize failed after terminal restart: {err}')
+            logger.info('MT5 terminal restarted and re-initialized successfully')
+        return self._conn
+
+    def _exec_and_get(self, setup_code, result_expr):
+        """Execute setup_code on remote, then return eval(result_expr) as a local value.
+        result_expr must evaluate to a primitive type (dict/list/str/int/float/bool/None).
+        """
+        conn = self._get_conn()
+        conn.execute(setup_code)
+        return conn.eval(result_expr)
 
     def ping(self, timeout=5.0):
         try:
-            self._connect()
-            info = self._mt5.account_info()
-            return info is not None
+            result = self._exec_and_get(
+                '_ai = mt5.account_info()',
+                '_ai.login if _ai else None'
+            )
+            return result is not None
         except Exception as e:
             logger.warning(f"MT5DirectClient ping failed: {e}")
+            self._conn = None
             return False
 
-    def get_account_info(self):
+    def get_account_info(self, timeout=5.0):
         try:
-            self._ensure_connected()
-            info = self._mt5.account_info()
-            if info is None:
-                return None
-            return {
-                'LOGIN':   str(info.login),
-                'BALANCE': str(round(info.balance, 2)),
-                'EQUITY':  str(round(info.equity, 2)),
-                'SERVER':  info.server,
-            }
+            result = self._exec_and_get(
+                """
+_ai = mt5.account_info()
+_ai_dict = {"LOGIN": str(_ai.login), "BALANCE": str(round(_ai.balance, 2)),
+             "EQUITY": str(round(_ai.equity, 2)), "SERVER": str(_ai.server),
+             "ACCT_TRADE": "1" if _ai.trade_allowed else "0"} if _ai else None
+""",
+                '_ai_dict'
+            )
+            return result
         except Exception as e:
             logger.warning(f"MT5 get_account_info failed: {e}")
             return None
 
     def get_tick(self, pair, timeout=5.0):
         try:
-            self._ensure_connected()
             sym = _sym(pair)
-            tick = self._mt5.symbol_info_tick(sym)
-            if tick is None:
+            result = self._exec_and_get(
+                f'_tick = mt5.symbol_info_tick("{sym}")',
+                f'{{"bid": float(_tick.bid), "ask": float(_tick.ask)}} if _tick else None'
+            )
+            if result is None:
                 return None
-            return {
-                'pair': pair,
-                'bid':  tick.bid,
-                'ask':  tick.ask,
-                'time': datetime.utcnow(),
-            }
+            return {'pair': pair, 'bid': result['bid'], 'ask': result['ask'],
+                    'time': datetime.utcnow()}
         except Exception as e:
-            logger.warning(f"MT5 get_tick failed: {e}")
+            logger.warning(f"MT5 get_tick({pair}) failed: {e}")
             return None
 
     def place_order(self, pair, direction, volume, sl_price, tp_price, timeout=10.0):
         try:
-            self._ensure_connected()
             sym = _sym(pair)
-            tick = self._mt5.symbol_info_tick(sym)
+
+            # Get fresh tick
+            tick = self._exec_and_get(
+                f'_tick = mt5.symbol_info_tick("{sym}")',
+                f'{{"bid": float(_tick.bid), "ask": float(_tick.ask)}} if _tick else None'
+            )
             if tick is None:
                 return {'success': False, 'reason': 'No tick data'}
 
-            order_type = ORDER_TYPE_BUY if direction == 'BUY' else ORDER_TYPE_SELL
-            price = tick.ask if direction == 'BUY' else tick.bid
+            price = tick['ask'] if direction == 'BUY' else tick['bid']
 
-            request = {
-                'action':    self._mt5.TRADE_ACTION_DEAL,
-                'symbol':    sym,
-                'volume':    float(round(volume, 2)),
-                'type':      order_type,
-                'price':     price,
-                'sl':        float(sl_price),
-                'tp':        float(tp_price),
-                'deviation': 20,
-                'magic':     20250518,
-                'comment':   'ForexBot',
-                'type_time': self._mt5.ORDER_TIME_GTC,
-                'type_filling': ORDER_FILLING_FOK,
-            }
+            # Recalculate SL/TP from fresh price — prevents "Invalid stops" when
+            # price has moved more than SL_PIPS since signal generation.
+            sl_pips = int(os.getenv('SL_PIPS', '30'))
+            tp_pips = int(os.getenv('TP_PIPS', '60'))
+            pip = 0.01 if 'JPY' in sym else 0.0001
+            if direction == 'BUY':
+                sl = round(price - sl_pips * pip, 5)
+                tp = round(price + tp_pips * pip, 5)
+            else:
+                sl = round(price + sl_pips * pip, 5)
+                tp = round(price - tp_pips * pip, 5)
 
-            result = self._mt5.order_send(request)
+            # Detect filling mode supported by symbol (FOK=1 flag, IOC=2 flag)
+            fill_mode = self._exec_and_get(
+                f'_si = mt5.symbol_info("{sym}")',
+                'int(_si.filling_mode) if _si else 1'
+            )
+            fill = 0   # ORDER_FILLING_FOK
+            if fill_mode & 1:
+                fill = 0
+            elif fill_mode & 2:
+                fill = 1   # ORDER_FILLING_IOC
+            else:
+                fill = 2   # ORDER_FILLING_RETURN
+
+            order_type = 0 if direction == 'BUY' else 1
+            vol = float(round(volume, 2))
+
+            result = self._exec_and_get(
+                f"""
+_req = {{
+    "action":       mt5.TRADE_ACTION_DEAL,
+    "symbol":       "{sym}",
+    "volume":       {vol},
+    "type":         {order_type},
+    "price":        {price},
+    "sl":           {sl},
+    "tp":           {tp},
+    "deviation":    20,
+    "magic":        20250518,
+    "comment":      "ForexBot",
+    "type_time":    mt5.ORDER_TIME_GTC,
+    "type_filling": {fill},
+}}
+_r = mt5.order_send(_req)
+_r_dict = {{"retcode": int(_r.retcode), "order": int(_r.order), "price": float(_r.price), "comment": str(_r.comment)}} if _r else None
+""",
+                '_r_dict'
+            )
+
             if result is None:
-                return {'success': False, 'reason': str(self._mt5.last_error())}
+                err = self._exec_and_get('', 'str(mt5.last_error())')
+                return {'success': False, 'reason': f'order_send None: {err}'}
 
-            if result.retcode == self._mt5.TRADE_RETCODE_DONE:
+            if result['retcode'] == 10009:  # TRADE_RETCODE_DONE
                 return {
                     'success': True,
-                    'ticket': result.order,
-                    'price':  result.price,
+                    'ticket': result['order'],
+                    'price':  result['price'],
                     'reason': 'OK',
                 }
-            return {'success': False, 'reason': f'{result.retcode}: {result.comment}'}
+            return {'success': False, 'reason': f"{result['retcode']}: {result['comment']}"}
 
         except Exception as e:
             logger.error(f"MT5 place_order failed: {e}")
+            self._conn = None
             return {'success': False, 'reason': str(e)}
 
     def close_order(self, ticket, timeout=10.0):
         try:
-            self._ensure_connected()
-            positions = self._mt5.positions_get(ticket=int(ticket))
-            if not positions:
+            # Get position details
+            pos = self._exec_and_get(
+                f'_pos = mt5.positions_get(ticket={int(ticket)})',
+                '{"symbol": str(_pos[0].symbol), "volume": float(_pos[0].volume), "type": int(_pos[0].type)} if _pos else None'
+            )
+            if pos is None:
                 return {'success': False, 'reason': 'Position not found'}
 
-            pos = positions[0]
-            sym = pos.symbol
-            tick = self._mt5.symbol_info_tick(sym)
+            sym   = pos['symbol']
+            vol   = pos['volume']
+            ptype = pos['type']   # 0=BUY, 1=SELL
+
+            tick = self._exec_and_get(
+                f'_tick = mt5.symbol_info_tick("{sym}")',
+                f'{{"bid": float(_tick.bid), "ask": float(_tick.ask)}} if _tick else None'
+            )
             if tick is None:
                 return {'success': False, 'reason': 'No tick data'}
 
-            close_type = ORDER_TYPE_SELL if pos.type == 0 else ORDER_TYPE_BUY
-            close_price = tick.bid if pos.type == 0 else tick.ask
+            close_price = tick['bid'] if ptype == 0 else tick['ask']
+            close_type  = 1 if ptype == 0 else 0
 
-            request = {
-                'action':    self._mt5.TRADE_ACTION_DEAL,
-                'symbol':    sym,
-                'volume':    pos.volume,
-                'type':      close_type,
-                'position':  ticket,
-                'price':     close_price,
-                'deviation': 20,
-                'magic':     20250518,
-                'comment':   'ForexBot close',
-                'type_time': self._mt5.ORDER_TIME_GTC,
-                'type_filling': ORDER_FILLING_FOK,
-            }
+            fill_mode = self._exec_and_get(
+                f'_si = mt5.symbol_info("{sym}")',
+                'int(_si.filling_mode) if _si else 1'
+            )
+            fill = 0
+            if fill_mode & 1:
+                fill = 0
+            elif fill_mode & 2:
+                fill = 1
+            else:
+                fill = 2
 
-            result = self._mt5.order_send(request)
+            result = self._exec_and_get(
+                f"""
+_req = {{
+    "action":       mt5.TRADE_ACTION_DEAL,
+    "symbol":       "{sym}",
+    "volume":       {vol},
+    "type":         {close_type},
+    "position":     {int(ticket)},
+    "price":        {close_price},
+    "deviation":    20,
+    "magic":        20250518,
+    "comment":      "ForexBot close",
+    "type_time":    mt5.ORDER_TIME_GTC,
+    "type_filling": {fill},
+}}
+_r = mt5.order_send(_req)
+_r_dict = {{"retcode": int(_r.retcode), "comment": str(_r.comment)}} if _r else None
+""",
+                '_r_dict'
+            )
+
             if result is None:
-                return {'success': False, 'reason': str(self._mt5.last_error())}
-
-            if result.retcode == self._mt5.TRADE_RETCODE_DONE:
+                return {'success': False, 'reason': 'close order_send returned None'}
+            if result['retcode'] == 10009:
                 return {'success': True}
-            return {'success': False, 'reason': f'{result.retcode}: {result.comment}'}
+            return {'success': False, 'reason': f"{result['retcode']}: {result['comment']}"}
 
         except Exception as e:
             logger.error(f"MT5 close_order failed: {e}")
+            self._conn = None
+            return {'success': False, 'reason': str(e)}
+
+    def modify_order(self, ticket, sl_price, tp_price, timeout=10.0):
+        try:
+            pos = self._exec_and_get(
+                f'_pos = mt5.positions_get(ticket={int(ticket)})',
+                '{"symbol": str(_pos[0].symbol)} if _pos else None'
+            )
+            if pos is None:
+                return {'success': False, 'reason': 'Position not found'}
+            sym = pos['symbol']
+
+            result = self._exec_and_get(
+                f"""
+_req = {{
+    "action":   mt5.TRADE_ACTION_SLTP,
+    "position": {int(ticket)},
+    "symbol":   "{sym}",
+    "sl":       {float(sl_price)},
+    "tp":       {float(tp_price)},
+}}
+_r = mt5.order_send(_req)
+_r_dict = {{"retcode": int(_r.retcode), "comment": str(_r.comment)}} if _r else None
+""",
+                '_r_dict'
+            )
+
+            if result is None:
+                return {'success': False, 'reason': 'modify returned None'}
+            if result['retcode'] == 10009:
+                return {'success': True}
+            return {'success': False, 'reason': f"{result['retcode']}: {result['comment']}"}
+
+        except Exception as e:
+            logger.error(f"MT5 modify_order failed: {e}")
+            self._conn = None
             return {'success': False, 'reason': str(e)}
 
     def get_positions(self, timeout=5.0):
         try:
-            self._ensure_connected()
-            positions = self._mt5.positions_get()
-            if positions is None:
-                return []
-            result = []
-            for p in positions:
-                result.append({
-                    'ticket':     p.ticket,
-                    'symbol':     p.symbol,
-                    'direction':  'BUY' if p.type == 0 else 'SELL',
-                    'volume':     p.volume,
-                    'open_price': p.price_open,
-                    'sl':         p.sl,
-                    'tp':         p.tp,
-                    'profit':     p.profit,
-                })
-            return result
+            result = self._exec_and_get(
+                """
+_positions = mt5.positions_get()
+_pos_list = [{"ticket": int(p.ticket), "symbol": str(p.symbol),
+               "direction": "BUY" if int(p.type) == 0 else "SELL",
+               "volume": float(p.volume), "open_price": float(p.price_open),
+               "sl": float(p.sl), "tp": float(p.tp), "profit": float(p.profit)}
+              for p in (_positions or [])]
+""",
+                '_pos_list'
+            )
+            return result or []
         except Exception as e:
             logger.warning(f"MT5 get_positions failed: {e}")
             return []

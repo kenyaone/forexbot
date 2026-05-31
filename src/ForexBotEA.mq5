@@ -112,6 +112,8 @@ string CmdOrder(ENUM_ORDER_TYPE type, string &parts[])
       return "ERR|EA live trading not enabled — right-click EA on chart → Properties → Common → Allow live trading";
    if (!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
       return "ERR|Terminal algo trading disabled — click Algo Trading button in toolbar";
+   if (!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+      return "ERR|Account trading disabled — check MT5 account permissions or broker restrictions";
 
    string symbol = parts[1];
    double volume = StringToDouble(parts[2]);
@@ -125,6 +127,16 @@ string CmdOrder(ENUM_ORDER_TYPE type, string &parts[])
    if (!SymbolInfoTick(symbol, tick))
       return "ERR|no tick for " + symbol;
 
+   // Use broker's supported filling mode — IOC works on IC Markets; FOK may be rejected
+   ENUM_ORDER_TYPE_FILLING fill = ORDER_FILLING_IOC;
+   long fill_flags = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   if ((fill_flags & SYMBOL_FILLING_FOK) != 0)
+      fill = ORDER_FILLING_FOK;
+   else if ((fill_flags & SYMBOL_FILLING_IOC) != 0)
+      fill = ORDER_FILLING_IOC;
+   else
+      fill = ORDER_FILLING_RETURN;
+
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
    req.volume       = volume;
@@ -136,7 +148,7 @@ string CmdOrder(ENUM_ORDER_TYPE type, string &parts[])
    req.magic        = 20250518;
    req.comment      = "ForexBot";
    req.type_time    = ORDER_TIME_GTC;
-   req.type_filling = ORDER_FILLING_FOK;
+   req.type_filling = fill;
 
    if (!OrderSend(req, res))
       return StringFormat("ERR|%d: %s", res.retcode, ResultRetcodeDescription(res.retcode));
