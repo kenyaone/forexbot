@@ -482,6 +482,12 @@ class ForexTradingBot:
             logger.info(f"{pair}: skip — position already open on {pair}")
             return
 
+        # Pair filter: no second position on a pair already open (any direction)
+        open_pairs = {o['pair'] for o in self.order_executor.open_orders.values()}
+        if pair in open_pairs:
+            logger.info(f"{pair}: skip — position already open on {pair}")
+            return
+
         # Direction filter: max 1 position per direction at a time
         dir_holders = {o['direction']: o['pair'] for o in self.order_executor.open_orders.values()}
         if signal['direction'] in dir_holders:
