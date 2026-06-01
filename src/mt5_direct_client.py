@@ -314,6 +314,90 @@ _pos_list = [{"ticket": int(p.ticket), "symbol": str(p.symbol),
             logger.warning(f"MT5 get_positions failed: {e}")
             return []
 
+    def get_deal_history(self, from_date=None, to_date=None):
+        """Return completed trades (matched IN+OUT deals) from MT5 history."""
+        try:
+            from datetime import timedelta
+            if from_date is None:
+                from_date = datetime.utcnow() - timedelta(days=90)
+            if to_date is None:
+                to_date = datetime.utcnow() + timedelta(hours=1)
+
+            from_ts = int(from_date.timestamp())
+            to_ts   = int(to_date.timestamp())
+
+            deals = self._exec_and_get(
+                f"""
+import datetime as _dt
+_deals = mt5.history_deals_get(
+    _dt.datetime.utcfromtimestamp({from_ts}),
+    _dt.datetime.utcfromtimestamp({to_ts})
+)
+_dl = []
+if _deals:
+    for _d in _deals:
+        _dl.append({{
+            'ticket':      int(_d.ticket),
+            'position_id': int(_d.position_id),
+            'time':        int(_d.time),
+            'symbol':      str(_d.symbol),
+            'type':        int(_d.type),   # 0=BUY deal, 1=SELL deal
+            'entry':       int(_d.entry),  # 0=IN, 1=OUT
+            'volume':      float(_d.volume),
+            'price':       float(_d.price),
+            'profit':      float(_d.profit),
+            'commission':  float(_d.commission),
+            'swap':        float(_d.swap),
+            'magic':       int(_d.magic),
+        }})
+""",
+                '_dl'
+            )
+            if not deals:
+                return []
+
+            # Group by position_id, match IN deal to OUT deal
+            by_pos = {}
+            for d in deals:
+                pid = d['position_id']
+                if pid not in by_pos:
+                    by_pos[pid] = {'in': None, 'out': None}
+                if d['entry'] == 0:   # DEAL_ENTRY_IN
+                    by_pos[pid]['in'] = d
+                elif d['entry'] == 1: # DEAL_ENTRY_OUT
+                    by_pos[pid]['out'] = d
+
+            trades = []
+            for pid, pair_deals in by_pos.items():
+                d_in  = pair_deals['in']
+                d_out = pair_deals['out']
+                if d_in is None or d_out is None:
+                    continue  # position still open or partial data
+                # Opening deal type tells us position direction
+                direction = 'BUY' if d_in['type'] == 0 else 'SELL'
+                pnl = d_out['profit'] + d_out['commission'] + d_out['swap']
+                trades.append({
+                    'position_id':  pid,
+                    'close_ticket': d_out['ticket'],
+                    'symbol':       d_out['symbol'],
+                    'direction':    direction,
+                    'volume':       d_in['volume'],
+                    'entry_price':  d_in['price'],
+                    'close_price':  d_out['price'],
+                    'open_time':    d_in['time'],
+                    'close_time':   d_out['time'],
+                    'profit':       d_out['profit'],
+                    'commission':   d_out['commission'],
+                    'swap':         d_out['swap'],
+                    'pnl':          pnl,
+                    'magic':        d_out['magic'],
+                })
+            return trades
+
+        except Exception as e:
+            logger.warning(f"MT5 get_deal_history failed: {e}")
+            return []
+
 
 def _sym(pair):
     s = _SYMBOL_MAP.get(pair)

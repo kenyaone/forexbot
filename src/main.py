@@ -35,6 +35,11 @@ _PAIR_CURRENCIES = {
     'USD/CHF': ['USD', 'CHF'],
 }
 
+_SYM_TO_PAIR = {
+    'EURUSD': 'EUR/USD', 'GBPUSD': 'GBP/USD', 'USDJPY': 'USD/JPY',
+    'AUDUSD': 'AUD/USD', 'USDCHF': 'USD/CHF',
+}
+
 # Load environment variables
 load_dotenv('config/.env')
 
@@ -368,7 +373,66 @@ class ForexTradingBot:
                 trends[pair] = None
         self._d1_trends = trends
         logger.info("D1 trends: " + " | ".join(f"{p}: {v}" for p, v in trends.items()))
-    
+
+    def _reconcile_history(self):
+        """Query MT5 deal history and record any closed trades not yet in MetricsTracker."""
+        if not self.mt5 or not hasattr(self.mt5, 'get_deal_history'):
+            return
+        try:
+            deals = self.mt5.get_deal_history()
+        except Exception as e:
+            logger.warning(f"History reconcile failed: {e}")
+            return
+
+        new_trades = []
+        for deal in deals:
+            if deal.get('magic') != 20250518:
+                continue
+            pid = deal['position_id']
+            if self.metrics.is_recorded(pid):
+                continue
+
+            pair = _SYM_TO_PAIR.get(deal['symbol'], deal['symbol'])
+            pip  = 0.01 if 'JPY' in pair else 0.0001
+            entry = deal['entry_price']
+            close = deal['close_price']
+            pnl_pips = ((close - entry) / pip if deal['direction'] == 'BUY'
+                        else (entry - close) / pip)
+
+            self.metrics.record_trade(
+                pair=pair,
+                direction=deal['direction'],
+                entry=entry,
+                close_price=close,
+                pnl_usd=deal['pnl'],
+                pnl_pips=pnl_pips,
+                outcome='TP' if deal['pnl'] > 0 else 'SL',
+                lot=deal['volume'],
+                slippage_pips=0.0,
+                confidence=0.0,
+                position_id=pid,
+            )
+            new_trades.append(deal)
+            logger.info(
+                f"History: {pair} {deal['direction']} | "
+                f"entry {entry:.5f} → close {close:.5f} | "
+                f"P&L ${deal['pnl']:+.2f} | lot {deal['volume']}"
+            )
+
+        if new_trades:
+            total_pnl = sum(d['pnl'] for d in new_trades)
+            wins  = sum(1 for d in new_trades if d['pnl'] > 0)
+            logger.info(f"Reconciled {len(new_trades)} historical trade(s) — total P&L ${total_pnl:+.2f}")
+            m = self.metrics.compute()
+            pf_str = f"{m['profit_factor']:.2f}" if m.get('profit_factor', float('inf')) != float('inf') else "∞"
+            _send_telegram(
+                f"<b>📋 History Reconciled — {len(new_trades)} trade(s) loaded</b>\n"
+                f"Wins: {wins}/{len(new_trades)} | P&L: <b>${total_pnl:+.2f}</b>\n"
+                f"All-time: WR {m['win_rate']:.1%} | PF {pf_str} | "
+                f"Sharpe {m['sharpe']:.2f} | MaxDD {m['max_drawdown']:.1%}\n"
+                f"Use /metrics for full breakdown"
+            )
+
     def process_pair(self, pair):
         """Generate signal and execute trade for a pair"""
         
@@ -410,6 +474,12 @@ class ForexTradingBot:
         # Session filter: only enter during London open or NY open
         if not self.is_entry_session():
             logger.info(f"{pair}: skip — outside entry session (London/NY open only)")
+            return
+
+        # Pair filter: never open a second position on the same pair regardless of direction
+        open_pairs = {o['pair'] for o in self.order_executor.open_orders.values()}
+        if pair in open_pairs:
+            logger.info(f"{pair}: skip — position already open on {pair}")
             return
 
         # Direction filter: max 1 position per direction at a time
@@ -660,21 +730,29 @@ class ForexTradingBot:
         self.running = True
         logger.info("Bot started with ML model")
         self._refresh_news()
+        self._reconcile_history()
 
         _send_telegram(
             f"<b>🤖 ForexBot Started</b>\n"
             f"Balance: <b>${self.current_equity:,.2f}</b>\n"
             f"Pairs: {', '.join(self.trading_pairs)}\n"
             f"Risk/trade: {int(self.risk_manager.risk_per_trade * 100)}% | "
-            f"Threshold: 55% confidence\n"
+            f"Threshold: {int(float(os.getenv('ML_THRESHOLD', '0.60')) * 100)}% confidence\n"
             f"{_utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
         )
 
         last_summary_day = None
+        last_reconcile_day = None
 
         try:
             while self.running:
                 self.run_one_cycle()
+
+                # Reconcile MT5 history once per day at 17:30 UTC
+                now = _utcnow()
+                if now.hour == 17 and now.minute >= 30 and last_reconcile_day != now.date():
+                    last_reconcile_day = now.date()
+                    self._reconcile_history()
 
                 # Send daily summary once per day at end of trading session
                 now = _utcnow()

@@ -18,20 +18,24 @@ class MetricsTracker:
         self.max_drawdown = 0.0
         self._load()
 
+    def is_recorded(self, position_id):
+        return any(t.get('position_id') == position_id for t in self.trades)
+
     def record_trade(self, pair, direction, entry, close_price, pnl_usd, pnl_pips,
-                     outcome, lot, slippage_pips=0.0, confidence=0.0):
+                     outcome, lot, slippage_pips=0.0, confidence=0.0, position_id=None):
         self.trades.append({
-            'timestamp': datetime.utcnow().isoformat(),
-            'pair': pair,
-            'direction': direction,
-            'entry': entry,
-            'close': close_price,
-            'pnl_usd': pnl_usd,
-            'pnl_pips': pnl_pips,
-            'outcome': outcome,
-            'lot': lot,
+            'timestamp':    datetime.utcnow().isoformat(),
+            'pair':         pair,
+            'direction':    direction,
+            'entry':        entry,
+            'close':        close_price,
+            'pnl_usd':      pnl_usd,
+            'pnl_pips':     pnl_pips,
+            'outcome':      outcome,
+            'lot':          lot,
             'slippage_pips': slippage_pips,
-            'confidence': confidence,
+            'confidence':   confidence,
+            'position_id':  position_id,
         })
         self._save()
 
