@@ -210,16 +210,6 @@ class OrderExecutor:
                     self.risk_manager.add_trade(pair, pos['direction'], pos['open_price'],
                                                 pos['sl'], pos['tp'], pos['volume'])
                     logger.info(f"Reconcile: loaded MT5 position {tid} ({pair} {pos['direction']})")
-                    # Alert so user knows about positions loaded on startup
-                    try:
-                        from src.alerting import alert_trade_opened
-                        alert_trade_opened(
-                            pair=pair, direction=pos['direction'], volume=pos['volume'],
-                            entry=pos['open_price'], sl=pos['sl'], tp=pos['tp'],
-                            confidence=0.0, ticket=int(tid),
-                        )
-                    except Exception:
-                        pass
         except Exception as e:
             logger.warning(f"MT5 sync failed: {e}")
 

@@ -198,7 +198,7 @@ class ForexTradingBot:
         self.running = False
         self.daily_pnl = 0
         self.weekly_pnl = 0
-        self.total_trades = 8  # trades placed before this session (from MT5 history)
+        self.total_trades = self._load_trade_counter()
         self._cross_data = {}
         self._cycle_count = 0
         self._scan_results = {}  # pair → (direction, confidence)
@@ -207,6 +207,8 @@ class ForexTradingBot:
         self._d1_trends = {}   # pair → 'UP' | 'DOWN' | None
         self._paused = False
         self._tg_offset = 0
+        self._feed_fail_count = 0   # consecutive cycles with no fresh data on any pair
+        self._feed_halted = False
         self._last_health_ping = None
         self._week_start_equity = account_equity
         self._day_start_equity = account_equity
@@ -435,19 +437,32 @@ class ForexTradingBot:
 
     def process_pair(self, pair):
         """Generate signal and execute trade for a pair"""
-        
+
         # Fetch latest data
         df = self.data_pipeline.fetch_historical_data(pair, timeframe='H1', bars=100)
         if df is None or df.empty:
-            logger.warning(f"{pair}: no data available — skipping")
+            self._feed_fail_count += 1
+            logger.warning(f"{pair}: no data available (feed failures: {self._feed_fail_count})")
+            if self._feed_fail_count >= 5 and not self._feed_halted:
+                self._feed_halted = True
+                _send_telegram("⛔ <b>Data feed down</b> — 5 consecutive failures. No new trades until feed recovers.")
+                logger.error("Data feed down — halting new trades")
             return
         latest_bar = df['time'].iloc[-1] if 'time' in df.columns else None
         if latest_bar is not None and self._last_bar_time.get(pair) == latest_bar:
-            logger.info(f"{pair}: data unchanged since last cycle — skipping inference")
+            logger.debug(f"{pair}: data unchanged since last cycle — skipping inference")
             return
+        # Fresh data — reset feed failure state
+        if self._feed_fail_count > 0 or self._feed_halted:
+            self._feed_fail_count = 0
+            self._feed_halted = False
+            _send_telegram("✅ <b>Data feed restored</b> — resuming normal operation.")
         self._last_bar_time[pair] = latest_bar
         df = self.data_pipeline.normalise_data(df)
         
+        if self._feed_halted:
+            return
+
         # Calculate indicators
         df = self.signal_engine.calculate_indicators(df)
 
@@ -473,25 +488,25 @@ class ForexTradingBot:
 
         # Session filter: only enter during London open or NY open
         if not self.is_entry_session():
-            logger.info(f"{pair}: skip — outside entry session (London/NY open only)")
+            logger.debug(f"{pair}: skip — outside entry session (London/NY open only)")
             return
 
         # Pair filter: never open a second position on the same pair regardless of direction
         open_pairs = {o['pair'] for o in self.order_executor.open_orders.values()}
         if pair in open_pairs:
-            logger.info(f"{pair}: skip — position already open on {pair}")
+            logger.debug(f"{pair}: skip — position already open on {pair}")
             return
 
         # Pair filter: no second position on a pair already open (any direction)
         open_pairs = {o['pair'] for o in self.order_executor.open_orders.values()}
         if pair in open_pairs:
-            logger.info(f"{pair}: skip — position already open on {pair}")
+            logger.debug(f"{pair}: skip — position already open on {pair}")
             return
 
         # Direction filter: max 1 position per direction at a time
         dir_holders = {o['direction']: o['pair'] for o in self.order_executor.open_orders.values()}
         if signal['direction'] in dir_holders:
-            logger.info(f"{pair}: skip — {signal['direction']} already open on {dir_holders[signal['direction']]}")
+            logger.debug(f"{pair}: skip — {signal['direction']} already open on {dir_holders[signal['direction']]}")
             return
 
         # Correlation filter: block same-direction entry on highly correlated pairs
@@ -503,7 +518,7 @@ class ForexTradingBot:
                       if o['direction'] == signal['direction']}
         for group in _CORRELATED:
             if pair in group and open_pairs & group:
-                logger.info(f"{pair}: skip — correlated position already open ({open_pairs & group})")
+                logger.debug(f"{pair}: skip — correlated position already open ({open_pairs & group})")
                 return
 
         # News blackout: skip 30 min around high-impact events
@@ -524,7 +539,7 @@ class ForexTradingBot:
         if bid > 0 and ask > 0:
             current_spread = (ask - bid) / pip
             if current_spread > max_spread_pips:
-                logger.info(f"{pair}: skip — spread {current_spread:.1f} pips > max {max_spread_pips} pips")
+                logger.debug(f"{pair}: skip — spread {current_spread:.1f} pips > max {max_spread_pips} pips")
                 return
         sl_pips = self.sl_pips
         tp_pips = self.tp_pips
@@ -552,6 +567,7 @@ class ForexTradingBot:
         
         if result['success']:
             self.total_trades += 1
+            self._save_trade_counter()
             logger.info(f"Order placed: {result['order_id']} | {pair} {signal['direction']} {lot_size} lots | ML conf: {ml_confidence:.2%} | trade #{self.total_trades}")
             alert_trade_opened(
                 pair=pair, direction=signal['direction'], volume=lot_size,
@@ -569,6 +585,22 @@ class ForexTradingBot:
             logger.warning(f"Order rejected: {result['reason']}")
             _send_telegram(f"⚠️ <b>Order rejected</b>\n{pair} {signal['direction']} — <code>{result['reason']}</code>")
     
+    _COUNTER_FILE = 'config/trade_counter.txt'
+
+    def _load_trade_counter(self):
+        try:
+            with open(self._COUNTER_FILE) as f:
+                return int(f.read().strip())
+        except Exception:
+            return 0
+
+    def _save_trade_counter(self):
+        try:
+            with open(self._COUNTER_FILE, 'w') as f:
+                f.write(str(self.total_trades))
+        except Exception as e:
+            logger.warning(f"Could not save trade counter: {e}")
+
     def check_exits(self):
         """Monitor open trades and close if TP/SL/time exit"""
         now = _utcnow()
@@ -629,9 +661,24 @@ class ForexTradingBot:
             logger.info("Outside trading hours — skipping cycle")
             return
 
+        # Friday 21:00 UTC — close all positions before weekend gap
+        now = _utcnow()
+        now_dow = now.weekday()  # 4=Friday, 5=Saturday, 6=Sunday
+        if now_dow == 4 and now.hour >= 21:
+            open_orders = list(self.order_executor.open_orders.items())
+            if open_orders:
+                logger.info(f"Friday close: shutting {len(open_orders)} position(s) before weekend gap")
+                _send_telegram(f"🌙 <b>Friday close</b> — shutting {len(open_orders)} position(s) before weekend gap")
+                for order_id, order in open_orders:
+                    tick = self.data_pipeline.get_live_tick(order['pair'])
+                    close_price = (tick['bid'] + tick['ask']) / 2 if tick else order['entry_price']
+                    result = self.order_executor.close_order(order_id, close_price, reason='FRIDAY_CLOSE')
+                    pnl = result.get('pnl_usd', 0) if result else 0
+                    logger.info(f"Friday close: {order['pair']} {order['direction']} closed | P&L ${pnl:+.2f}")
+            return
+
         # Forex markets closed Saturday and most of Sunday
-        now_dow = _utcnow().weekday()  # 5=Saturday, 6=Sunday
-        if now_dow == 5 or (now_dow == 6 and _utcnow().hour < 21):
+        if now_dow == 5 or (now_dow == 6 and now.hour < 21):
             logger.info("Weekend — markets closed, skipping cycle")
             return
         

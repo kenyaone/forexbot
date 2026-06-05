@@ -71,16 +71,19 @@ class SignalEngine:
                     candidate = 'SELL'
 
             # --- SECONDARY: TREND FOLLOWING (trend regime + expanding ATR) ---
+            # D1 trend filter applied here: only trade with the daily trend
             if candidate is None and adx > 25 and atr_expanding:
                 if ema20 > ema50 and 40 < rsi < 65:
-                    candidate = 'BUY'
+                    if d1_trend != 'DOWN':   # UP or unknown — allow BUY
+                        candidate = 'BUY'
                 elif ema20 < ema50 and 35 < rsi < 60:
-                    candidate = 'SELL'
+                    if d1_trend != 'UP':     # DOWN or unknown — allow SELL
+                        candidate = 'SELL'
 
         if candidate is None:
             return {'direction': 'NONE', 'confidence': 0, 'regime': regime, 'reason': 'No signal'}
 
-        # D1 trend filter disabled — mean-reversion entries fire in any direction
+        # Mean-reversion signals fire in any direction (betting on reversion, not trend)
 
         if ml_confidence >= self.ml_threshold:
             return {
