@@ -21,6 +21,8 @@ _SYMBOL_MAP = {
     'USD/JPY': 'USDJPY',
     'AUD/USD': 'AUDUSD',
     'USD/CHF': 'USDCHF',
+    'NZD/USD': 'NZDUSD',
+    'USD/CAD': 'USDCAD',
 }
 
 

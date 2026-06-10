@@ -5,7 +5,8 @@ logger = logging.getLogger(__name__)
 
 _MT5_SYM_TO_PAIR = {
     'EURUSD': 'EUR/USD', 'GBPUSD': 'GBP/USD', 'USDJPY': 'USD/JPY',
-    'AUDUSD': 'AUD/USD', 'USDCHF': 'USD/CHF',
+    'AUDUSD': 'AUD/USD', 'USDCHF': 'USD/CHF', 'NZDUSD': 'NZD/USD',
+    'USDCAD': 'USD/CAD',
 }
 
 

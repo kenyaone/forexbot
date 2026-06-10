@@ -65,9 +65,9 @@ class SignalEngine:
         else:
             # --- PRIMARY: MEAN REVERSION ---
             if not atr_expanding:
-                if close <= bb_lower * 1.03 and rsi < 42:
+                if close <= bb_lower * 1.04 and rsi < 45:
                     candidate = 'BUY'
-                elif close >= bb_upper * 0.97 and rsi > 65:
+                elif close >= bb_upper * 0.96 and rsi > 62:
                     candidate = 'SELL'
 
             # --- SECONDARY: TREND FOLLOWING (trend regime + expanding ATR) ---
